@@ -20,7 +20,8 @@ dependencies = [
   "plotly",
   "pydantic",
   "joblib",
-  "openpyxl"
+  "openpyxl",
+  "pyproj"
 ]
 
 [tool.setuptools]
