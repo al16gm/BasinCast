@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it."
+title: "HydroForecast-Med"
+type: software
+license: MIT
+authors:
+  - family-names: "Garcia-Monteagudo"
+    given-names: "Alejandro"
+  - family-names: "Arnaldos"
+    given-names: "Marina"
+  - family-names: "Pardo"
+    given-names: "Miguel A."
+repository-code: "https://github.com/al16gm/BasinCast"
