@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+outputs/
+git rm --cached outputs/hello_output.csv
+git add .gitignore
+git commit -m "Ignore outputs folder"
+git push
