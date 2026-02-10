@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -21,8 +22,15 @@ class InferredMapping:
     suggested_drop_cols: List[str]
 
 
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", "_", str(s).strip().lower())
+    s = _strip_accents(str(s).strip().lower())
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9_]+", "", s)
+    return s
 
 
 def infer_mapping(df: pd.DataFrame) -> InferredMapping:
@@ -35,26 +43,24 @@ def infer_mapping(df: pd.DataFrame) -> InferredMapping:
                 return norm_map[cand]
         return None
 
-    date_col = pick("date", "datetime", "timestamp", "time", "month")
-    point_id_col = pick("control_point", "point_id", "point", "id", "station", "gauge", "cp")
-    value_col = pick("value", "y", "target", "level", "storage", "discharge", "flow")
-    unit_col = pick("unit", "units")
-    resource_type_col = pick("input", "resource_type", "type")
+    date_col = pick("date", "fecha", "datetime", "timestamp", "time", "mes", "month")
+    point_id_col = pick("control_point", "point_id", "punto", "estacion", "station", "gauge", "nombre", "id")
+    value_col = pick("value", "valor", "y", "target", "nivel", "level", "storage", "discharge", "caudal", "flow")
+    unit_col = pick("unit", "units", "unidad", "unidades")
+    resource_type_col = pick("input", "resource_type", "type", "tipologia", "typology", "recurso")
 
-    lat_col = pick("lat", "latitude")
-    lon_col = pick("lon", "longitude", "long")
+    lat_col = pick("lat", "latitude", "latitud")
+    lon_col = pick("lon", "longitude", "long", "longitud")
     utm_x_col = pick("utm_x", "x_utm", "easting", "utm_e", "x")
     utm_y_col = pick("utm_y", "y_utm", "northing", "utm_n", "y")
 
-    # Suggest dropping typical "derived feature" columns (noise for users)
-    drop = []
+    drop: List[str] = []
     for c in cols:
         n = _norm(c)
         if (
             n.endswith("_lag1")
             or n.endswith("_lag12")
             or n in {"month", "sin", "cos"}
-            or n.startswith("value_lag")
             or n.endswith("_lag")
         ):
             drop.append(c)

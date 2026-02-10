@@ -2,21 +2,31 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from pyproj import CRS, Transformer
 
 from basincast.translator.reader import load_user_file, summarize_table
 from basincast.translator.infer import infer_mapping, column_missing_pct
+from basincast.translator.parsing import (
+    parse_date_series,
+    parse_numeric_series,
+    coerce_month_start,
+)
+from basincast.translator.normalize import (
+    CANON_RESOURCE_TYPES,
+    suggest_value_map,
+    apply_value_map,
+)
 
+st.set_page_config(page_title="BasinCast Translator (v0.3)", layout="wide")
+st.title("BasinCast — Input Translator (v0.3)")
+st.write("Upload Excel/CSV. BasinCast auto-detects fields, you confirm, then we export a canonical dataset safely.")
 
-st.set_page_config(page_title="BasinCast Translator (v0.2)", layout="wide")
-st.title("BasinCast — Input Translator (v0.2)")
-st.write("Upload an Excel/CSV. BasinCast will **auto-detect** fields, you **confirm**, then we export a canonical dataset.")
-
+QUALITY_THRESHOLD = 0.99
 
 uploaded = st.file_uploader("Upload a file (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
-
 if uploaded is None:
     st.stop()
 
@@ -30,27 +40,83 @@ st.success(f"Loaded {len(tables)} table(s).")
 
 table_names = [t.name for t in tables]
 selected_name = st.selectbox("Select table/sheet", table_names, index=0)
-df = next(t.df for t in tables if t.name == selected_name).copy()
+table = next(t for t in tables if t.name == selected_name)
+df = table.df.copy()
 
-info = summarize_table(df)
 st.subheader("Table summary")
-st.json(info)
+st.json(summarize_table(df))
+
+with st.expander("Show raw->normalized column name map (for invisible spaces)"):
+    st.json(table.raw_to_normalized_columns)
 
 st.subheader("Preview")
 st.dataframe(df.head(25), width="stretch")
 
-st.subheader("Auto-detected mapping (editable)")
+# --- Auto-detection ---
+st.subheader("1) Auto-detected mapping (editable)")
 inf = infer_mapping(df)
+all_cols = ["(none)"] + list(df.columns.astype(str))
 
-cols = ["(none)"] + list(df.columns.astype(str))
+date_col = st.selectbox("Date column", all_cols, index=all_cols.index(inf.date_col) if inf.date_col in all_cols else 0)
+point_col = st.selectbox("Point ID column (optional)", all_cols, index=all_cols.index(inf.point_id_col) if inf.point_id_col in all_cols else 0)
+value_col = st.selectbox("Value column (ENDO target)", all_cols, index=all_cols.index(inf.value_col) if inf.value_col in all_cols else 0)
+unit_col = st.selectbox("Unit column (optional)", all_cols, index=all_cols.index(inf.unit_col) if inf.unit_col in all_cols else 0)
+rtype_col = st.selectbox("Resource type column (optional)", all_cols, index=all_cols.index(inf.resource_type_col) if inf.resource_type_col in all_cols else 0)
 
-date_col = st.selectbox("Date column", cols, index=cols.index(inf.date_col) if inf.date_col in cols else 0)
-point_col = st.selectbox("Point ID column (optional)", cols, index=cols.index(inf.point_id_col) if inf.point_id_col in cols else 0)
-value_col = st.selectbox("Value column (ENDO target)", cols, index=cols.index(inf.value_col) if inf.value_col in cols else 0)
-unit_col = st.selectbox("Unit column (optional)", cols, index=cols.index(inf.unit_col) if inf.unit_col in cols else 0)
-rtype_col = st.selectbox("Resource type column (optional)", cols, index=cols.index(inf.resource_type_col) if inf.resource_type_col in cols else 0)
+# --- Robust parsing options (only if needed) ---
+st.subheader("2) Robust parsing (dates & numbers)")
 
-st.markdown("### Coordinates")
+date_hint = "auto"
+num_hint = "auto"
+
+with st.expander("Advanced parsing options (use only if parsing fails)"):
+    date_hint = st.radio("Date interpretation", ["auto", "dayfirst", "monthfirst", "excel_serial"], index=0)
+    num_hint = st.radio("Number format", ["auto", "comma_decimal", "dot_decimal"], index=0)
+
+if date_col == "(none)" or value_col == "(none)":
+    st.warning("Select at least Date column and Value column to continue.")
+    st.stop()
+
+date_parsed, date_rep = parse_date_series(df[date_col], date_hint=date_hint)
+date_month = coerce_month_start(date_parsed)
+
+value_num, value_rep = parse_numeric_series(df[value_col], locale_hint=num_hint)
+
+c1, c2 = st.columns(2)
+with c1:
+    st.metric("Date parse OK ratio", f"{date_rep.ok_ratio:.3f}")
+    st.caption(f"Strategy: {date_rep.strategy} | Ambiguous: {date_rep.details.get('ambiguous', False)}")
+with c2:
+    st.metric("Value parse OK ratio", f"{value_rep.ok_ratio:.3f}")
+    st.caption(f"Strategy: {value_rep.strategy}")
+
+if date_rep.details.get("ambiguous", False) and date_hint == "auto":
+    st.warning("Date format looks ambiguous (dd/mm vs mm/dd). If dates look wrong, open Advanced options and choose dayfirst/monthfirst.")
+
+if date_rep.ok_ratio < QUALITY_THRESHOLD or value_rep.ok_ratio < QUALITY_THRESHOLD:
+    st.error(
+        "Parsing quality is below threshold. "
+        "Open Advanced parsing options and adjust date/number interpretation until OK ratio is high."
+    )
+    with st.expander("Examples (raw → normalized)"):
+        st.write("Numeric examples:")
+        st.json(value_rep.details)
+        st.write("Date parsing details:")
+        st.json(date_rep.details)
+    st.stop()
+
+# Effective rows: avoid blank Excel rows killing missing stats
+mask_eff = date_month.notna() & value_num.notna()
+df_eff = df.loc[mask_eff].copy()
+df_eff["_date"] = date_month.loc[mask_eff]
+df_eff["_value"] = value_num.loc[mask_eff]
+
+st.subheader("3) Quality summary on effective rows")
+n_points = df_eff[point_col].nunique() if point_col != "(none)" and point_col in df_eff.columns else 1
+st.write(f"Effective rows: **{df_eff.shape[0]}** | Points detected: **{n_points}**")
+
+# --- Coordinates ---
+st.subheader("4) Coordinates")
 coord_mode = st.radio("Coordinate type", ["Auto", "Lat/Lon", "UTM", "No coordinates"], index=0)
 
 lat_col = lon_col = utm_x_col = utm_y_col = "(none)"
@@ -58,96 +124,123 @@ utm_zone = 30
 utm_hemisphere = "N"
 
 if coord_mode in ["Auto", "Lat/Lon"]:
-    lat_col = st.selectbox("Latitude column", cols, index=cols.index(inf.lat_col) if inf.lat_col in cols else 0)
-    lon_col = st.selectbox("Longitude column", cols, index=cols.index(inf.lon_col) if inf.lon_col in cols else 0)
+    lat_col = st.selectbox("Latitude column", all_cols, index=all_cols.index(inf.lat_col) if inf.lat_col in all_cols else 0)
+    lon_col = st.selectbox("Longitude column", all_cols, index=all_cols.index(inf.lon_col) if inf.lon_col in all_cols else 0)
 
 if coord_mode in ["Auto", "UTM"]:
-    utm_x_col = st.selectbox("UTM X (Easting) column", cols, index=cols.index(inf.utm_x_col) if inf.utm_x_col in cols else 0)
-    utm_y_col = st.selectbox("UTM Y (Northing) column", cols, index=cols.index(inf.utm_y_col) if inf.utm_y_col in cols else 0)
-    utm_zone = st.number_input("UTM zone (integer)", min_value=1, max_value=60, value=30, step=1)
+    utm_x_col = st.selectbox("UTM X (Easting) column", all_cols, index=all_cols.index(inf.utm_x_col) if inf.utm_x_col in all_cols else 0)
+    utm_y_col = st.selectbox("UTM Y (Northing) column", all_cols, index=all_cols.index(inf.utm_y_col) if inf.utm_y_col in all_cols else 0)
+    utm_zone = st.number_input("UTM zone", min_value=1, max_value=60, value=30, step=1)
     utm_hemisphere = st.selectbox("Hemisphere", ["N", "S"], index=0)
 
-st.markdown("### Noise filtering")
-missing = column_missing_pct(df)
-with st.expander("Show missing % by column"):
-    st.dataframe(missing.to_frame("missing_pct"), width="stretch")
+# --- Noise filtering (on effective rows) ---
+st.subheader("5) Noise filtering (recommended)")
+missing_eff = column_missing_pct(df_eff.drop(columns=["_date", "_value"], errors="ignore"))
 
+role_cols = {c for c in [date_col, point_col, value_col, unit_col, rtype_col, lat_col, lon_col, utm_x_col, utm_y_col] if c and c != "(none)"}
 default_drop = set(inf.suggested_drop_cols)
-auto_drop_high_missing = set(missing[missing > 95.0].index.tolist())
-suggested_drop = sorted(list(default_drop.union(auto_drop_high_missing)))
+auto_drop_high_missing = set(missing_eff[missing_eff > 95.0].index.tolist())
+suggested_drop = sorted(list((default_drop.union(auto_drop_high_missing)) - role_cols))
 
 drop_cols = st.multiselect(
-    "Columns to hide/ignore (recommended pre-filled)",
+    "Columns to hide/ignore (does NOT affect export except for UI cleanliness)",
     list(df.columns.astype(str)),
     default=suggested_drop,
 )
 
-if drop_cols:
-    df_view = df.drop(columns=drop_cols, errors="ignore")
-else:
-    df_view = df
-
-st.subheader("Preview after hiding ignored columns")
+df_view = df.drop(columns=drop_cols, errors="ignore")
 st.dataframe(df_view.head(25), width="stretch")
 
-st.markdown("## Build canonical dataset")
+# --- Value mapping for resource_type and units ---
+st.subheader("6) Value mapping (user confirms)")
+
+resource_type_value_map = {}
+unit_value_map = {}
+
+if rtype_col != "(none)" and rtype_col in df_eff.columns:
+    observed = sorted([v for v in df_eff[rtype_col].dropna().astype(str).map(str.strip).unique().tolist() if v != ""])
+    resource_type_value_map = suggest_value_map(observed, CANON_RESOURCE_TYPES, score_cutoff=75)
+    st.write("Map observed resource types → canonical (edit if needed):")
+    map_df = pd.DataFrame({"observed": list(resource_type_value_map.keys()), "canonical": list(resource_type_value_map.values())})
+    edited = st.data_editor(
+        map_df,
+        hide_index=True,
+        column_config={
+            "canonical": st.column_config.SelectboxColumn("canonical", options=CANON_RESOURCE_TYPES)
+        },
+        width="stretch",
+    )
+    resource_type_value_map = dict(zip(edited["observed"].astype(str), edited["canonical"].astype(str)))
+
+if unit_col != "(none)" and unit_col in df_eff.columns:
+    observed_u = sorted([v for v in df_eff[unit_col].dropna().astype(str).map(str.strip).unique().tolist() if v != ""])
+    unit_value_map = {u: u for u in observed_u}
+    st.write("Units (keep or standardize):")
+    unit_df = pd.DataFrame({"observed": list(unit_value_map.keys()), "canonical": list(unit_value_map.values())})
+    edited_u = st.data_editor(unit_df, hide_index=True, width="stretch")
+    unit_value_map = dict(zip(edited_u["observed"].astype(str), edited_u["canonical"].astype(str)))
+
+# --- Build canonical dataset ---
+st.subheader("7) Export canonical dataset")
 if st.button("✅ Build & Export canonical CSV", type="primary"):
-    if date_col == "(none)" or value_col == "(none)":
-        st.error("You must select at least Date column and Value column.")
-        st.stop()
+    d = df_eff.copy()
 
-    d = df.copy()
-
-    # Parse dates
-    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
-    d = d.dropna(subset=[date_col])
-
-    # Point id
-    if point_col != "(none)":
-        d["point_id"] = d[point_col].astype(str)
+    # point id
+    if point_col != "(none)" and point_col in d.columns:
+        d["point_id"] = d[point_col].astype(str).map(str.strip)
     else:
         single_id = st.text_input("No point_id column detected. Enter a point id:", value="POINT_001")
         d["point_id"] = single_id
 
-    # Value
-    d["value"] = pd.to_numeric(d[value_col], errors="coerce")
-    d = d.dropna(subset=["value"])
+    d["date"] = d["_date"]
+    d["value"] = d["_value"]
 
-    # Unit/type
-    d["unit"] = d[unit_col].astype(str) if unit_col != "(none)" else ""
-    d["resource_type"] = d[rtype_col].astype(str) if rtype_col != "(none)" else ""
+    d["unit"] = d[unit_col].astype(str).map(str.strip) if unit_col != "(none)" and unit_col in d.columns else ""
+    d["resource_type"] = d[rtype_col].astype(str).map(str.strip) if rtype_col != "(none)" and rtype_col in d.columns else ""
 
-    # Coordinates handling
-    d["lat"] = None
-    d["lon"] = None
+    # apply mappings
+    if resource_type_value_map and "resource_type" in d.columns:
+        d["resource_type"] = apply_value_map(d["resource_type"], resource_type_value_map)
+    if unit_value_map and "unit" in d.columns:
+        d["unit"] = apply_value_map(d["unit"], unit_value_map)
 
-    has_latlon = (lat_col != "(none)" and lon_col != "(none)")
-    has_utm = (utm_x_col != "(none)" and utm_y_col != "(none)")
+    # Coordinates
+    d["lat"] = np.nan
+    d["lon"] = np.nan
+
+    has_latlon = (lat_col != "(none)" and lon_col != "(none)" and lat_col in d.columns and lon_col in d.columns)
+    has_utm = (utm_x_col != "(none)" and utm_y_col != "(none)" and utm_x_col in d.columns and utm_y_col in d.columns)
 
     if coord_mode == "Lat/Lon" or (coord_mode == "Auto" and has_latlon):
-        d["lat"] = pd.to_numeric(d[lat_col], errors="coerce")
-        d["lon"] = pd.to_numeric(d[lon_col], errors="coerce")
+        lat_num, _ = parse_numeric_series(d[lat_col], locale_hint=num_hint)
+        lon_num, _ = parse_numeric_series(d[lon_col], locale_hint=num_hint)
+        d["lat"] = lat_num
+        d["lon"] = lon_num
 
     elif coord_mode == "UTM" or (coord_mode == "Auto" and (not has_latlon) and has_utm):
-        x = pd.to_numeric(d[utm_x_col], errors="coerce")
-        y = pd.to_numeric(d[utm_y_col], errors="coerce")
-
+        x_num, _ = parse_numeric_series(d[utm_x_col], locale_hint=num_hint)
+        y_num, _ = parse_numeric_series(d[utm_y_col], locale_hint=num_hint)
         epsg = (32600 + int(utm_zone)) if utm_hemisphere == "N" else (32700 + int(utm_zone))
         transformer = Transformer.from_crs(CRS.from_epsg(epsg), CRS.from_epsg(4326), always_xy=True)
-
-        lon, lat = transformer.transform(x.to_numpy(), y.to_numpy())
+        lon, lat = transformer.transform(x_num.to_numpy(), y_num.to_numpy())
         d["lat"] = lat
         d["lon"] = lon
 
-    # Keep only canonical columns
-    canonical = d[[date_col, "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
-    canonical = canonical.rename(columns={date_col: "date"})
+    canonical = d[["date", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
     canonical = canonical.sort_values(["point_id", "date"])
 
-    # Build mapping for reproducibility + original labels
+    # Pre-flight checks
+    dup = canonical.duplicated(subset=["point_id", "date"]).sum()
+    if dup > 0:
+        st.warning(f"Found {dup} duplicated (point_id, date) rows. We keep them as-is for now; later we can aggregate.")
+
+    st.success(f"Canonical built: {canonical.shape[0]} rows | {canonical['point_id'].nunique()} point(s)")
+    st.dataframe(canonical.head(25), width="stretch")
+
     mapping = {
         "source_file": uploaded.name,
         "sheet": selected_name,
+        "column_name_map_raw_to_normalized": table.raw_to_normalized_columns,
         "date_col": date_col,
         "point_id_col": point_col,
         "value_col": value_col,
@@ -160,17 +253,33 @@ if st.button("✅ Build & Export canonical CSV", type="primary"):
         "utm_y_col": utm_y_col,
         "utm_zone": int(utm_zone),
         "utm_hemisphere": utm_hemisphere,
-        "ignored_columns": drop_cols,
-	"resource_type_value_map": {},
-	"unit_value_map": {},
-	"lag_policy": {"train": "drop", "forecast": "repeat_first"},
+        "ignored_columns_ui": drop_cols,
+        "parsing": {
+            "date_hint": date_hint,
+            "number_locale_hint": num_hint,
+            "quality_threshold": QUALITY_THRESHOLD,
+            "date_strategy": date_rep.strategy,
+            "value_strategy": value_rep.strategy,
+        },
+        "resource_type_value_map": resource_type_value_map,
+        "unit_value_map": unit_value_map,
+        "lag_policy": {"train": "drop", "forecast": "repeat_first"},
+        "row_filter": {
+            "rule": "keep rows where date and value parse correctly",
+            "effective_rows": int(df_eff.shape[0]),
+        },
     }
 
-    st.success(f"Canonical dataset built: {canonical.shape[0]} rows | {canonical['point_id'].nunique()} point(s)")
-    st.dataframe(canonical.head(25), width="stretch")
+    st.download_button(
+        "⬇️ Download canonical_timeseries.csv",
+        data=canonical.to_csv(index=False).encode("utf-8"),
+        file_name="canonical_timeseries.csv",
+        mime="text/csv",
+    )
 
-    csv_bytes = canonical.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download canonical_timeseries.csv", data=csv_bytes, file_name="canonical_timeseries.csv", mime="text/csv")
-
-    json_bytes = json.dumps(mapping, indent=2).encode("utf-8")
-    st.download_button("⬇️ Download mapping.json", data=json_bytes, file_name="mapping.json", mime="application/json")
+    st.download_button(
+        "⬇️ Download mapping.json",
+        data=json.dumps(mapping, indent=2, ensure_ascii=False).encode("utf-8"),
+        file_name="mapping.json",
+        mime="application/json",
+    )
