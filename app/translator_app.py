@@ -20,11 +20,83 @@ from basincast.translator.normalize import (
     apply_value_map,
 )
 
-st.set_page_config(page_title="BasinCast Translator (v0.3)", layout="wide")
-st.title("BasinCast — Input Translator (v0.3)")
-st.write("Upload Excel/CSV. BasinCast auto-detects fields, you confirm, then we export a canonical dataset safely.")
+st.set_page_config(page_title="BasinCast Translator (v0.4)", layout="wide")
+st.title("BasinCast — Input Translator (v0.4)")
+st.write(
+    "Upload Excel/CSV. BasinCast auto-detects fields; you confirm; then we export a canonical dataset safely.\n\n"
+    "**New in v0.4:** mandatory confirmation + error-row exports + temporal integrity checks."
+)
 
 QUALITY_THRESHOLD = 0.99
+
+
+def build_parse_error_rows(
+    df_raw: pd.DataFrame,
+    date_col: str,
+    value_col: str,
+    date_month: pd.Series,
+    value_num: pd.Series,
+) -> pd.DataFrame:
+    """
+    Return rows where input had something, but parsing failed.
+    """
+    out = df_raw.copy()
+    out["_date_parsed"] = date_month
+    out["_value_parsed"] = value_num
+
+    reasons = []
+    for i in range(len(out)):
+        r = []
+        raw_date = out.iloc[i][date_col]
+        raw_val = out.iloc[i][value_col]
+
+        date_fail = pd.notna(raw_date) and pd.isna(out.iloc[i]["_date_parsed"])
+        val_fail = pd.notna(raw_val) and pd.isna(out.iloc[i]["_value_parsed"])
+
+        if date_fail:
+            r.append("date_parse_failed")
+        if val_fail:
+            r.append("value_parse_failed")
+        reasons.append(";".join(r))
+
+    out["_parse_error_reason"] = reasons
+    err = out[out["_parse_error_reason"] != ""].copy()
+    return err
+
+
+def temporal_integrity_reports(canonical: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      dup_rows: duplicated (point_id, date) rows
+      missing_months: rows describing missing months per point_id
+    """
+    c = canonical.copy()
+    c["date"] = pd.to_datetime(c["date"], errors="coerce")
+
+    # duplicates
+    dup_mask = c.duplicated(subset=["point_id", "date"], keep=False)
+    dup_rows = c.loc[dup_mask].sort_values(["point_id", "date"]).copy()
+
+    # missing months per point
+    missing_records = []
+    for pid, g in c.dropna(subset=["date"]).groupby("point_id"):
+        dates = pd.to_datetime(g["date"]).sort_values()
+        if dates.empty:
+            continue
+        start = dates.min()
+        end = dates.max()
+        expected = pd.date_range(start=start, end=end, freq="MS")
+        observed = pd.DatetimeIndex(dates.unique())
+        missing = expected.difference(observed)
+        for m in missing:
+            missing_records.append({"point_id": pid, "missing_month": m})
+
+    missing_months = pd.DataFrame(missing_records)
+    return dup_rows, missing_months
+
+
+if "confirmed_mapping" not in st.session_state:
+    st.session_state["confirmed_mapping"] = False
 
 uploaded = st.file_uploader("Upload a file (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
 if uploaded is None:
@@ -46,7 +118,7 @@ df = table.df.copy()
 st.subheader("Table summary")
 st.json(summarize_table(df))
 
-with st.expander("Show raw->normalized column name map (for invisible spaces)"):
+with st.expander("Show raw→normalized column name map (handles trailing spaces, invisible whitespace)"):
     st.json(table.raw_to_normalized_columns)
 
 st.subheader("Preview")
@@ -57,25 +129,24 @@ st.subheader("1) Auto-detected mapping (editable)")
 inf = infer_mapping(df)
 all_cols = ["(none)"] + list(df.columns.astype(str))
 
-date_col = st.selectbox("Date column", all_cols, index=all_cols.index(inf.date_col) if inf.date_col in all_cols else 0)
+date_col = st.selectbox("Date column (required)", all_cols, index=all_cols.index(inf.date_col) if inf.date_col in all_cols else 0)
 point_col = st.selectbox("Point ID column (optional)", all_cols, index=all_cols.index(inf.point_id_col) if inf.point_id_col in all_cols else 0)
-value_col = st.selectbox("Value column (ENDO target)", all_cols, index=all_cols.index(inf.value_col) if inf.value_col in all_cols else 0)
+value_col = st.selectbox("Value column (required, ENDO target)", all_cols, index=all_cols.index(inf.value_col) if inf.value_col in all_cols else 0)
 unit_col = st.selectbox("Unit column (optional)", all_cols, index=all_cols.index(inf.unit_col) if inf.unit_col in all_cols else 0)
 rtype_col = st.selectbox("Resource type column (optional)", all_cols, index=all_cols.index(inf.resource_type_col) if inf.resource_type_col in all_cols else 0)
 
+if date_col == "(none)" or value_col == "(none)":
+    st.warning("Select at least Date column and Value column to continue.")
+    st.stop()
+
 # --- Robust parsing options (only if needed) ---
 st.subheader("2) Robust parsing (dates & numbers)")
-
 date_hint = "auto"
 num_hint = "auto"
 
 with st.expander("Advanced parsing options (use only if parsing fails)"):
     date_hint = st.radio("Date interpretation", ["auto", "dayfirst", "monthfirst", "excel_serial"], index=0)
     num_hint = st.radio("Number format", ["auto", "comma_decimal", "dot_decimal"], index=0)
-
-if date_col == "(none)" or value_col == "(none)":
-    st.warning("Select at least Date column and Value column to continue.")
-    st.stop()
 
 date_parsed, date_rep = parse_date_series(df[date_col], date_hint=date_hint)
 date_month = coerce_month_start(date_parsed)
@@ -90,15 +161,31 @@ with c2:
     st.metric("Value parse OK ratio", f"{value_rep.ok_ratio:.3f}")
     st.caption(f"Strategy: {value_rep.strategy}")
 
+# --- Parsing error rows export ---
+st.subheader("2.1) Pre-flight error rows (download if any)")
+error_rows = build_parse_error_rows(df, date_col, value_col, date_month, value_num)
+
+if len(error_rows) == 0:
+    st.success("No parsing errors detected ✅")
+else:
+    st.warning(f"Found {len(error_rows)} row(s) with parsing errors. Download and fix them, or adjust Advanced parsing options.")
+    st.dataframe(error_rows.head(25), width="stretch")
+    st.download_button(
+        "⬇️ Download parse_error_rows.csv",
+        data=error_rows.to_csv(index=False).encode("utf-8"),
+        file_name="parse_error_rows.csv",
+        mime="text/csv",
+    )
+
 if date_rep.details.get("ambiguous", False) and date_hint == "auto":
-    st.warning("Date format looks ambiguous (dd/mm vs mm/dd). If dates look wrong, open Advanced options and choose dayfirst/monthfirst.")
+    st.warning("Date format looks ambiguous (dd/mm vs mm/dd). If dates look wrong, choose dayfirst/monthfirst in Advanced parsing options.")
 
 if date_rep.ok_ratio < QUALITY_THRESHOLD or value_rep.ok_ratio < QUALITY_THRESHOLD:
     st.error(
-        "Parsing quality is below threshold. "
-        "Open Advanced parsing options and adjust date/number interpretation until OK ratio is high."
+        "Parsing quality is below threshold. Adjust Advanced parsing options until OK ratio is high "
+        f"(>= {QUALITY_THRESHOLD:.2f}). Export is blocked."
     )
-    with st.expander("Examples (raw → normalized)"):
+    with st.expander("Debug details"):
         st.write("Numeric examples:")
         st.json(value_rep.details)
         st.write("Date parsing details:")
@@ -143,7 +230,7 @@ auto_drop_high_missing = set(missing_eff[missing_eff > 95.0].index.tolist())
 suggested_drop = sorted(list((default_drop.union(auto_drop_high_missing)) - role_cols))
 
 drop_cols = st.multiselect(
-    "Columns to hide/ignore (does NOT affect export except for UI cleanliness)",
+    "Columns to hide/ignore (UI only — does NOT change export columns)",
     list(df.columns.astype(str)),
     default=suggested_drop,
 )
@@ -153,7 +240,6 @@ st.dataframe(df_view.head(25), width="stretch")
 
 # --- Value mapping for resource_type and units ---
 st.subheader("6) Value mapping (user confirms)")
-
 resource_type_value_map = {}
 unit_value_map = {}
 
@@ -165,9 +251,7 @@ if rtype_col != "(none)" and rtype_col in df_eff.columns:
     edited = st.data_editor(
         map_df,
         hide_index=True,
-        column_config={
-            "canonical": st.column_config.SelectboxColumn("canonical", options=CANON_RESOURCE_TYPES)
-        },
+        column_config={"canonical": st.column_config.SelectboxColumn("canonical", options=CANON_RESOURCE_TYPES)},
         width="stretch",
     )
     resource_type_value_map = dict(zip(edited["observed"].astype(str), edited["canonical"].astype(str)))
@@ -180,72 +264,63 @@ if unit_col != "(none)" and unit_col in df_eff.columns:
     edited_u = st.data_editor(unit_df, hide_index=True, width="stretch")
     unit_value_map = dict(zip(edited_u["observed"].astype(str), edited_u["canonical"].astype(str)))
 
-# --- Build canonical dataset ---
-st.subheader("7) Export canonical dataset")
-if st.button("✅ Build & Export canonical CSV", type="primary"):
-    d = df_eff.copy()
+# --- Build canonical dataset (pre-check) ---
+st.subheader("7) Confirmation (mandatory before export)")
 
-    # point id
-    if point_col != "(none)" and point_col in d.columns:
-        d["point_id"] = d[point_col].astype(str).map(str.strip)
-    else:
-        single_id = st.text_input("No point_id column detected. Enter a point id:", value="POINT_001")
-        d["point_id"] = single_id
+# build canonical preview (without downloading yet)
+d = df_eff.copy()
 
-    d["date"] = d["_date"]
-    d["value"] = d["_value"]
+if point_col != "(none)" and point_col in d.columns:
+    d["point_id"] = d[point_col].astype(str).map(str.strip)
+else:
+    d["point_id"] = "POINT_001"
 
-    d["unit"] = d[unit_col].astype(str).map(str.strip) if unit_col != "(none)" and unit_col in d.columns else ""
-    d["resource_type"] = d[rtype_col].astype(str).map(str.strip) if rtype_col != "(none)" and rtype_col in d.columns else ""
+d["date"] = d["_date"]
+d["value"] = d["_value"]
+d["unit"] = d[unit_col].astype(str).map(str.strip) if unit_col != "(none)" and unit_col in d.columns else ""
+d["resource_type"] = d[rtype_col].astype(str).map(str.strip) if rtype_col != "(none)" and rtype_col in d.columns else ""
 
-    # apply mappings
-    if resource_type_value_map and "resource_type" in d.columns:
-        d["resource_type"] = apply_value_map(d["resource_type"], resource_type_value_map)
-    if unit_value_map and "unit" in d.columns:
-        d["unit"] = apply_value_map(d["unit"], unit_value_map)
+if resource_type_value_map and "resource_type" in d.columns:
+    d["resource_type"] = apply_value_map(d["resource_type"], resource_type_value_map)
+if unit_value_map and "unit" in d.columns:
+    d["unit"] = apply_value_map(d["unit"], unit_value_map)
 
-    # Coordinates
-    d["lat"] = np.nan
-    d["lon"] = np.nan
+d["lat"] = np.nan
+d["lon"] = np.nan
 
-    has_latlon = (lat_col != "(none)" and lon_col != "(none)" and lat_col in d.columns and lon_col in d.columns)
-    has_utm = (utm_x_col != "(none)" and utm_y_col != "(none)" and utm_x_col in d.columns and utm_y_col in d.columns)
+has_latlon = (lat_col != "(none)" and lon_col != "(none)" and lat_col in d.columns and lon_col in d.columns)
+has_utm = (utm_x_col != "(none)" and utm_y_col != "(none)" and utm_x_col in d.columns and utm_y_col in d.columns)
 
-    if coord_mode == "Lat/Lon" or (coord_mode == "Auto" and has_latlon):
-        lat_num, _ = parse_numeric_series(d[lat_col], locale_hint=num_hint)
-        lon_num, _ = parse_numeric_series(d[lon_col], locale_hint=num_hint)
-        d["lat"] = lat_num
-        d["lon"] = lon_num
+if coord_mode == "Lat/Lon" or (coord_mode == "Auto" and has_latlon):
+    lat_num, _ = parse_numeric_series(d[lat_col], locale_hint=num_hint)
+    lon_num, _ = parse_numeric_series(d[lon_col], locale_hint=num_hint)
+    d["lat"] = lat_num
+    d["lon"] = lon_num
+elif coord_mode == "UTM" or (coord_mode == "Auto" and (not has_latlon) and has_utm):
+    x_num, _ = parse_numeric_series(d[utm_x_col], locale_hint=num_hint)
+    y_num, _ = parse_numeric_series(d[utm_y_col], locale_hint=num_hint)
+    epsg = (32600 + int(utm_zone)) if utm_hemisphere == "N" else (32700 + int(utm_zone))
+    transformer = Transformer.from_crs(CRS.from_epsg(epsg), CRS.from_epsg(4326), always_xy=True)
+    lon, lat = transformer.transform(x_num.to_numpy(), y_num.to_numpy())
+    d["lat"] = lat
+    d["lon"] = lon
 
-    elif coord_mode == "UTM" or (coord_mode == "Auto" and (not has_latlon) and has_utm):
-        x_num, _ = parse_numeric_series(d[utm_x_col], locale_hint=num_hint)
-        y_num, _ = parse_numeric_series(d[utm_y_col], locale_hint=num_hint)
-        epsg = (32600 + int(utm_zone)) if utm_hemisphere == "N" else (32700 + int(utm_zone))
-        transformer = Transformer.from_crs(CRS.from_epsg(epsg), CRS.from_epsg(4326), always_xy=True)
-        lon, lat = transformer.transform(x_num.to_numpy(), y_num.to_numpy())
-        d["lat"] = lat
-        d["lon"] = lon
+canonical = d[["date", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
+canonical = canonical.sort_values(["point_id", "date"])
 
-    canonical = d[["date", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
-    canonical = canonical.sort_values(["point_id", "date"])
+# Integrity reports
+dup_rows, missing_months = temporal_integrity_reports(canonical)
 
-    # Pre-flight checks
-    dup = canonical.duplicated(subset=["point_id", "date"]).sum()
-    if dup > 0:
-        st.warning(f"Found {dup} duplicated (point_id, date) rows. We keep them as-is for now; later we can aggregate.")
-
-    st.success(f"Canonical built: {canonical.shape[0]} rows | {canonical['point_id'].nunique()} point(s)")
-    st.dataframe(canonical.head(25), width="stretch")
-
-    mapping = {
-        "source_file": uploaded.name,
-        "sheet": selected_name,
-        "column_name_map_raw_to_normalized": table.raw_to_normalized_columns,
-        "date_col": date_col,
-        "point_id_col": point_col,
-        "value_col": value_col,
-        "unit_col": unit_col,
-        "resource_type_col": rtype_col,
+# Confirmation summary
+summary = {
+    "source_file": uploaded.name,
+    "sheet": selected_name,
+    "role_columns": {
+        "date": date_col,
+        "value": value_col,
+        "point_id": point_col,
+        "unit": unit_col,
+        "resource_type": rtype_col,
         "coord_mode": coord_mode,
         "lat_col": lat_col,
         "lon_col": lon_col,
@@ -253,33 +328,120 @@ if st.button("✅ Build & Export canonical CSV", type="primary"):
         "utm_y_col": utm_y_col,
         "utm_zone": int(utm_zone),
         "utm_hemisphere": utm_hemisphere,
-        "ignored_columns_ui": drop_cols,
-        "parsing": {
-            "date_hint": date_hint,
-            "number_locale_hint": num_hint,
-            "quality_threshold": QUALITY_THRESHOLD,
-            "date_strategy": date_rep.strategy,
-            "value_strategy": value_rep.strategy,
-        },
-        "resource_type_value_map": resource_type_value_map,
-        "unit_value_map": unit_value_map,
-        "lag_policy": {"train": "drop", "forecast": "repeat_first"},
-        "row_filter": {
-            "rule": "keep rows where date and value parse correctly",
-            "effective_rows": int(df_eff.shape[0]),
-        },
-    }
+    },
+    "parsing": {
+        "date_hint": date_hint,
+        "number_locale_hint": num_hint,
+        "quality_threshold": QUALITY_THRESHOLD,
+        "date_strategy": date_rep.strategy,
+        "value_strategy": value_rep.strategy,
+        "date_ok_ratio": float(date_rep.ok_ratio),
+        "value_ok_ratio": float(value_rep.ok_ratio),
+    },
+    "data": {
+        "effective_rows": int(df_eff.shape[0]),
+        "points_detected": int(canonical["point_id"].nunique()),
+        "date_min": str(pd.to_datetime(canonical["date"]).min().date()),
+        "date_max": str(pd.to_datetime(canonical["date"]).max().date()),
+    },
+    "integrity": {
+        "duplicate_point_date_rows": int(len(dup_rows)),
+        "missing_months_rows": int(len(missing_months)),
+    },
+}
 
-    st.download_button(
-        "⬇️ Download canonical_timeseries.csv",
-        data=canonical.to_csv(index=False).encode("utf-8"),
-        file_name="canonical_timeseries.csv",
-        mime="text/csv",
-    )
+st.write("**Review & confirm before export:**")
+st.json(summary)
 
-    st.download_button(
-        "⬇️ Download mapping.json",
-        data=json.dumps(mapping, indent=2, ensure_ascii=False).encode("utf-8"),
-        file_name="mapping.json",
-        mime="application/json",
-    )
+cA, cB = st.columns(2)
+with cA:
+    st.write("Canonical preview (first 25 rows):")
+    st.dataframe(canonical.head(25), width="stretch")
+
+with cB:
+    st.write("Integrity checks:")
+    if len(dup_rows) == 0:
+        st.success("No duplicates (point_id, date) ✅")
+    else:
+        st.warning(f"Duplicates found: {len(dup_rows)} row(s)")
+        st.dataframe(dup_rows.head(25), width="stretch")
+        st.download_button(
+            "⬇️ Download duplicates_point_date.csv",
+            data=dup_rows.to_csv(index=False).encode("utf-8"),
+            file_name="duplicates_point_date.csv",
+            mime="text/csv",
+        )
+
+    if len(missing_months) == 0:
+        st.success("No missing months detected ✅")
+    else:
+        st.warning(f"Missing months detected: {len(missing_months)} month(s)")
+        st.dataframe(missing_months.head(25), width="stretch")
+        st.download_button(
+            "⬇️ Download missing_months.csv",
+            data=missing_months.to_csv(index=False).encode("utf-8"),
+            file_name="missing_months.csv",
+            mime="text/csv",
+        )
+
+# Mandatory confirmation
+st.write("---")
+st.write("### ✅ Step 7.1 — Confirm mapping")
+if st.button("I confirm the mapping and parsing settings are correct", type="secondary"):
+    st.session_state["confirmed_mapping"] = True
+
+if not st.session_state["confirmed_mapping"]:
+    st.warning("Export is locked until you confirm the mapping above.")
+    st.stop()
+
+# --- Export ---
+st.subheader("8) Export canonical dataset")
+mapping = {
+    "source_file": uploaded.name,
+    "sheet": selected_name,
+    "column_name_map_raw_to_normalized": table.raw_to_normalized_columns,
+    "date_col": date_col,
+    "point_id_col": point_col,
+    "value_col": value_col,
+    "unit_col": unit_col,
+    "resource_type_col": rtype_col,
+    "coord_mode": coord_mode,
+    "lat_col": lat_col,
+    "lon_col": lon_col,
+    "utm_x_col": utm_x_col,
+    "utm_y_col": utm_y_col,
+    "utm_zone": int(utm_zone),
+    "utm_hemisphere": utm_hemisphere,
+    "ignored_columns_ui": drop_cols,
+    "parsing": {
+        "date_hint": date_hint,
+        "number_locale_hint": num_hint,
+        "quality_threshold": QUALITY_THRESHOLD,
+        "date_strategy": date_rep.strategy,
+        "value_strategy": value_rep.strategy,
+        "date_ok_ratio": float(date_rep.ok_ratio),
+        "value_ok_ratio": float(value_rep.ok_ratio),
+    },
+    "resource_type_value_map": resource_type_value_map,
+    "unit_value_map": unit_value_map,
+    "lag_policy": {"train": "drop", "forecast": "repeat_first"},
+    "row_filter": {"rule": "keep rows where date and value parse correctly", "effective_rows": int(df_eff.shape[0])},
+    "integrity": {
+        "duplicate_point_date_rows": int(len(dup_rows)),
+        "missing_months_rows": int(len(missing_months)),
+    },
+}
+
+st.success("Confirmed ✅ Export is now enabled.")
+st.download_button(
+    "⬇️ Download canonical_timeseries.csv",
+    data=canonical.to_csv(index=False).encode("utf-8"),
+    file_name="canonical_timeseries.csv",
+    mime="text/csv",
+)
+st.download_button(
+    "⬇️ Download mapping.json",
+    data=json.dumps(mapping, indent=2, ensure_ascii=False).encode("utf-8"),
+    file_name="mapping.json",
+    mime="application/json",
+)
