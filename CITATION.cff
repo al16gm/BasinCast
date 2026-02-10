@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it."
-title: "HydroForecast-Med"
+title: "BasinCast"
 type: software
 license: MIT
 authors:
