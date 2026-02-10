@@ -161,6 +161,9 @@ if st.button("✅ Build & Export canonical CSV", type="primary"):
         "utm_zone": int(utm_zone),
         "utm_hemisphere": utm_hemisphere,
         "ignored_columns": drop_cols,
+	"resource_type_value_map": {},
+	"unit_value_map": {},
+	"lag_policy": {"train": "drop", "forecast": "repeat_first"},
     }
 
     st.success(f"Canonical dataset built: {canonical.shape[0]} rows | {canonical['point_id'].nunique()} point(s)")

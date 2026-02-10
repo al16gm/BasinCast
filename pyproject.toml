@@ -17,6 +17,7 @@ dependencies = [
   "numpy",
   "streamlit",
   "scikit-learn",
+  "rapidfuzz",
   "plotly",
   "pydantic",
   "joblib",
