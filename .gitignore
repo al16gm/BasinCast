@@ -98,3 +98,6 @@ secrets.*
 
 # --- GitHub / CI local artifacts (optional) ---
 *.out
+
+# Local caches (NASA POWER, etc.)
+.cache/
