@@ -1,54 +1,598 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Tuple
 
-from basincast.core.pipeline import PipelineConfig, run_pipeline
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import BayesianRidge
+from sklearn.metrics import mean_squared_error
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="BasinCast Core v0.5.2 (Quality Gate + Fallbacks).")
-    p.add_argument("--input", type=str, required=True, help="Path to canonical_timeseries.csv")
-    p.add_argument("--outdir", type=str, default="outputs", help="Output directory")
-    p.add_argument("--horizons", type=str, default="12,24,36,48", help="Comma-separated horizons (months)")
-    p.add_argument("--test-months", type=int, default=96, help="Holdout length in months (paper-2 protocol)")
-    p.add_argument("--val-months", type=int, default=36, help="Inner validation months (model selection only)")
-    p.add_argument("--planning-kge", type=float, default=0.6, help="Planning-grade KGE threshold")
-    p.add_argument("--advisory-kge", type=float, default=0.3, help="Advisory-grade KGE threshold")
-    p.add_argument("--min-history-months", type=int, default=120, help="Minimum history months per point")
-    p.add_argument("--min-train-months", type=int, default=120, help="Minimum train months before holdout")
-    p.add_argument("--min-pairs", type=int, default=24, help="Minimum scored pairs per horizon")
-    return p.parse_args()
+# -----------------------------
+# Metrics
+# -----------------------------
+def kge(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    if len(y_true) < 2:
+        return np.nan
+
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    if np.isnan(r):
+        return np.nan
+
+    std_true = np.std(y_true)
+    std_pred = np.std(y_pred)
+    if std_true == 0 or std_pred == 0:
+        return np.nan
+
+    alpha = std_pred / std_true
+    mean_true = np.mean(y_true)
+    mean_pred = np.mean(y_pred)
+    if mean_true == 0:
+        return np.nan
+    beta = mean_pred / mean_true
+
+    return 1.0 - np.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+# -----------------------------
+# Feature engineering
+# -----------------------------
+EXOG_COLS = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
+
+
+def _month_sin_cos(dates: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+    m = pd.to_datetime(dates).dt.month.to_numpy()
+    return np.sin(2 * np.pi * m / 12.0), np.cos(2 * np.pi * m / 12.0)
+
+
+def make_features(df: pd.DataFrame, family: str) -> pd.DataFrame:
+    """
+    Build a modeling table in incremental space (delta_y) with ENDO or EXOG family.
+
+    ENDO features:
+      - value_lag1, value_lag12, delta_lag1, month_sin, month_cos
+
+    EXOG features:
+      - ENDO + exog_lag1 for precip/temp
+
+    Returns a DataFrame with feature columns + delta_y (target), indexed by date.
+    """
+    g = df.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce")
+    g = g.sort_values("date").reset_index(drop=True)
+
+    g["delta_y"] = g["value"].diff()
+
+    g["value_lag1"] = g["value"].shift(1)
+    g["value_lag12"] = g["value"].shift(12)
+    g["delta_lag1"] = g["delta_y"].shift(1)
+
+    msin, mcos = _month_sin_cos(g["date"])
+    g["month_sin"] = msin
+    g["month_cos"] = mcos
+
+    feat_cols = ["value_lag1", "value_lag12", "delta_lag1", "month_sin", "month_cos"]
+
+    if family == "EXOG_ML":
+        for c in EXOG_COLS:
+            if c not in g.columns:
+                raise ValueError(f"Missing EXOG column '{c}' for family=EXOG_ML")
+
+        for c in EXOG_COLS:
+            g[f"{c}_lag1"] = g[c].shift(1)
+            feat_cols.append(f"{c}_lag1")
+
+    out = g[["date", "delta_y"] + feat_cols].dropna().reset_index(drop=True)
+    return out
+
+
+# -----------------------------
+# Models
+# -----------------------------
+def model_zoo() -> Dict[str, object]:
+    return {
+        "bayes_ridge": BayesianRidge(),
+        "gbr": GradientBoostingRegressor(random_state=42),
+        "rf": RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1),
+    }
+
+
+def train_select_model(X_tr: pd.DataFrame, y_tr: pd.Series, X_val: pd.DataFrame, y_val: pd.Series) -> Tuple[object, str, float, float]:
+    best = None
+    best_name = ""
+    best_kge = -np.inf
+    best_rmse = np.inf
+
+    y_tr = pd.Series(y_tr).astype(float)
+    y_val = pd.Series(y_val).astype(float)
+
+    for name, model in model_zoo().items():
+        try:
+            model.fit(X_tr, y_tr)
+            pred = model.predict(X_val) if len(X_val) else np.array([])
+            k = kge(y_val.to_numpy(), pred) if len(pred) else np.nan
+            r = rmse(y_val.to_numpy(), pred) if len(pred) else np.nan
+            if np.isnan(k):
+                continue
+            if k > best_kge:
+                best = model
+                best_name = name
+                best_kge = float(k)
+                best_rmse = float(r)
+        except Exception:
+            continue
+
+    if best is None:
+        raise RuntimeError("No model could be trained successfully.")
+    return best, best_name, best_kge, best_rmse
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def grade_from_kge(val: float, planning: float, advisory: float) -> str:
+    if val is None or np.isnan(val):
+        return "INSUFFICIENT_DATA"
+    if val >= planning:
+        return "PLANNING"
+    if val >= advisory:
+        return "ADVISORY"
+    return "EXPLORATORY"
+
+
+def _align_features_for_model(model: object, feats: Dict[str, float]) -> pd.DataFrame:
+    """
+    Build a 1-row DataFrame aligned to the model feature order, if available.
+    This prevents subtle column-order bugs and avoids sklearn feature-name warnings.
+    """
+    cols = getattr(model, "feature_names_in_", None)
+    X = pd.DataFrame([feats])
+    if cols is not None:
+        return X.reindex(columns=list(cols), fill_value=0.0)
+    return X
+
+
+# -----------------------------
+# Recursive forecasting for backtest
+# -----------------------------
+def recursive_forecast_delta(
+    model,
+    history: pd.DataFrame,
+    exog_df: pd.DataFrame | None,
+    start_date: pd.Timestamp,
+    horizon: int,
+    family: str,
+) -> float:
+    """
+    Forecast y(start_date + horizon months) using recursive delta_y predictions.
+    history: df with columns date,value, sorted.
+    exog_df: df with columns date + EXOG_COLS (monthly), sorted.
+    """
+    hist = history.copy()
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist = hist.sort_values("date").reset_index(drop=True)
+
+    start_date = pd.to_datetime(start_date)
+    idx0 = hist.index[hist["date"] == start_date]
+    if len(idx0) == 0:
+        raise ValueError(f"start_date {start_date} not found in history.")
+    i0 = int(idx0[0])
+
+    y_buffer = hist.loc[:i0, "value"].to_list()
+    if len(y_buffer) >= 2:
+        last_delta = float(y_buffer[-1] - y_buffer[-2])
+    else:
+        last_delta = 0.0
+
+    cur_date = start_date
+
+    for step in range(1, horizon + 1):
+        next_date = (cur_date + pd.DateOffset(months=1)).to_period("M").to_timestamp()
+
+        y_lag1 = float(y_buffer[-1])
+        if len(y_buffer) >= 12:
+            y_lag12 = float(y_buffer[-12])
+        else:
+            y_lag12 = y_lag1
+
+        delta_lag1 = float(last_delta)
+
+        m = int(next_date.month)
+        month_sin = float(np.sin(2 * np.pi * m / 12.0))
+        month_cos = float(np.cos(2 * np.pi * m / 12.0))
+
+        feats = {
+            "value_lag1": y_lag1,
+            "value_lag12": y_lag12,
+            "delta_lag1": delta_lag1,
+            "month_sin": month_sin,
+            "month_cos": month_cos,
+        }
+
+        if family == "EXOG_ML":
+            if exog_df is None:
+                raise ValueError("EXOG_ML requires exog_df.")
+            exog_lag_date = (next_date - pd.DateOffset(months=1)).to_period("M").to_timestamp()
+            row = exog_df.loc[exog_df["date"] == exog_lag_date]
+            if len(row) == 0:
+                mm = int(exog_lag_date.month)
+                clim = exog_df.groupby(exog_df["date"].dt.month)[EXOG_COLS].mean(numeric_only=True)
+                vals = clim.loc[mm].to_dict()
+            else:
+                vals = row.iloc[0][EXOG_COLS].to_dict()
+
+            for c in EXOG_COLS:
+                feats[f"{c}_lag1"] = float(vals[c])
+
+        X = _align_features_for_model(model, feats)
+        delta_pred = float(model.predict(X)[0])
+
+        y_next = max(0.0, y_lag1 + delta_pred)
+
+        last_delta = delta_pred
+        y_buffer.append(y_next)
+        cur_date = next_date
+
+    return float(y_buffer[-1])
+
+
+def seasonal_baseline(history: pd.DataFrame, start_date: pd.Timestamp, horizon: int) -> float:
+    hist = history.copy()
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist = hist.sort_values("date").reset_index(drop=True)
+
+    start_date = pd.to_datetime(start_date)
+    target = (start_date + pd.DateOffset(months=horizon)).to_period("M").to_timestamp()
+    ref = (target - pd.DateOffset(months=12)).to_period("M").to_timestamp()
+
+    ref_row = hist.loc[hist["date"] == ref]
+    if len(ref_row) > 0:
+        return float(ref_row.iloc[0]["value"])
+
+    start_row = hist.loc[hist["date"] == start_date]
+    if len(start_row) > 0:
+        return float(start_row.iloc[0]["value"])
+
+    return float(hist.iloc[-1]["value"])
+
+
+# -----------------------------
+# Backtest + decision
+# -----------------------------
+@dataclass
+class RunConfig:
+    horizons: List[int] = None
+    holdout_months: int = 96
+    inner_val_months: int = 36
+    planning_kge: float = 0.6
+    advisory_kge: float = 0.3
+
+    def __post_init__(self):
+        if self.horizons is None:
+            self.horizons = [12, 24, 36, 48]
+
+
+def planning_horizon_from_kges(kges: Dict[int, float], threshold: float) -> int:
+    ok = [h for h, v in kges.items() if (v is not None and not np.isnan(v) and v >= threshold)]
+    return max(ok) if ok else 0
+
+
+def run_point(df_point: pd.DataFrame, cfg: RunConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    dfp = df_point.copy()
+    dfp["date"] = pd.to_datetime(dfp["date"], errors="coerce")
+    dfp = dfp.sort_values("date").reset_index(drop=True)
+
+    point_id = dfp["point_id"].iloc[0]
+    resource_type = dfp["resource_type"].iloc[0]
+    unit = dfp["unit"].iloc[0]
+
+    last_date = pd.to_datetime(dfp["date"].max()).to_period("M").to_timestamp()
+    cutoff = (last_date - pd.DateOffset(months=cfg.holdout_months)).to_period("M").to_timestamp()
+
+    families = ["ENDO_ML"]
+    has_exog = all(c in dfp.columns for c in EXOG_COLS)
+    if has_exog:
+        families.append("EXOG_ML")
+    families.append("BASELINE_SEASONAL")
+
+    warnings = []
+
+    if len(dfp) < (cfg.holdout_months + 120):
+        warnings.append("SHORT_SERIES")
+
+    train_mask = dfp["date"] <= cutoff
+    train_df = dfp.loc[train_mask].copy()
+    if len(train_df) < (cfg.inner_val_months + 120):
+        warnings.append("SHORT_TRAIN_WINDOW")
+
+    inner_cut = (cutoff - pd.DateOffset(months=cfg.inner_val_months)).to_period("M").to_timestamp()
+    inner_tr = train_df.loc[train_df["date"] <= inner_cut].copy()
+    inner_val = train_df.loc[train_df["date"] > inner_cut].copy()
+
+    model_info = {}
+    skill_rows = []
+
+    exog_df = None
+    if has_exog:
+        exog_df = dfp[["date"] + EXOG_COLS].copy()
+        exog_df["date"] = pd.to_datetime(exog_df["date"]).dt.to_period("M").dt.to_timestamp()
+
+    for fam in families:
+        if fam == "BASELINE_SEASONAL":
+            continue
+
+        feats_all = make_features(train_df, fam)
+        feats_tr = feats_all.loc[feats_all["date"] <= inner_cut].copy()
+        feats_val = feats_all.loc[feats_all["date"] > inner_cut].copy()
+
+        X_tr = feats_tr.drop(columns=["date", "delta_y"])
+        y_tr = feats_tr["delta_y"]
+        X_val = feats_val.drop(columns=["date", "delta_y"])
+        y_val = feats_val["delta_y"]
+
+        model, model_type, k_in, r_in = train_select_model(X_tr, y_tr, X_val, y_val)
+        model_info[fam] = (model, model_type, k_in, r_in)
+
+    holdout_origins = dfp.loc[(dfp["date"] >= cutoff) & (dfp["date"] <= last_date), "date"].tolist()
+
+    kge_by_family = {fam: {} for fam in families}
+    rmse_by_family = {fam: {} for fam in families}
+    npairs_by_family = {fam: {} for fam in families}
+
+    dfp_dates = pd.to_datetime(dfp["date"]).dt.to_period("M").dt.to_timestamp()
+    dfp = dfp.copy()
+    dfp["date"] = dfp_dates
+
+    for fam in families:
+        for h in cfg.horizons:
+            y_true = []
+            y_pred = []
+
+            for origin in holdout_origins:
+                origin = pd.to_datetime(origin).to_period("M").to_timestamp()
+                target = (origin + pd.DateOffset(months=h)).to_period("M").to_timestamp()
+
+                row_t = dfp.loc[dfp["date"] == target]
+                if len(row_t) == 0:
+                    continue
+
+                y_t = float(row_t.iloc[0]["value"])
+
+                if fam == "BASELINE_SEASONAL":
+                    y_hat = seasonal_baseline(dfp[["date", "value"]], origin, h)
+                else:
+                    model = model_info[fam][0]
+                    y_hat = recursive_forecast_delta(
+                        model=model,
+                        history=dfp[["date", "value"]],
+                        exog_df=exog_df,
+                        start_date=origin,
+                        horizon=h,
+                        family=fam,
+                    )
+
+                y_true.append(y_t)
+                y_pred.append(y_hat)
+
+            y_true = np.asarray(y_true, dtype=float)
+            y_pred = np.asarray(y_pred, dtype=float)
+
+            n_pairs = int(len(y_true))
+            npairs_by_family[fam][h] = n_pairs
+
+            if n_pairs < 24:
+                k = np.nan
+                r = np.nan
+            else:
+                k = kge(y_true, y_pred)
+                r = rmse(y_true, y_pred)
+
+            kge_by_family[fam][h] = float(k) if k is not None else np.nan
+            rmse_by_family[fam][h] = float(r) if r is not None else np.nan
+
+            skill_rows.append(
+                {
+                    "point_id": point_id,
+                    "resource_type": resource_type,
+                    "unit": unit,
+                    "family": fam,
+                    "horizon": h,
+                    "kge": kge_by_family[fam][h],
+                    "rmse": rmse_by_family[fam][h],
+                    "n_pairs": n_pairs,
+                    "model_type": model_info[fam][1] if fam in model_info else "",
+                }
+            )
+
+    skill_df = pd.DataFrame(skill_rows)
+
+    planning_h = {}
+    advisory_h = {}
+    for fam in families:
+        planning_h[fam] = planning_horizon_from_kges(kge_by_family[fam], cfg.planning_kge)
+        advisory_h[fam] = planning_horizon_from_kges(kge_by_family[fam], cfg.advisory_kge)
+
+    def rank_key(fam: str):
+        k12 = kge_by_family[fam].get(12, np.nan)
+        k12 = -1e9 if np.isnan(k12) else float(k12)
+        return (planning_h[fam], advisory_h[fam], k12)
+
+    selected = sorted(families, key=rank_key, reverse=True)[0]
+
+    if planning_h[selected] > 0:
+        decision = "MODEL_PLANNING" if selected in ("ENDO_ML", "EXOG_ML") else "BASELINE_PLANNING"
+        status = "OK"
+        reason = ""
+    elif advisory_h[selected] > 0:
+        decision = "MODEL_ADVISORY" if selected in ("ENDO_ML", "EXOG_ML") else "BASELINE_ADVISORY"
+        status = "WARN"
+        reason = "ONLY_ADVISORY_GRADE"
+    else:
+        decision = "NOT_RELIABLE"
+        status = "WARN"
+        reason = "SKILL_BELOW_ADVISORY_THRESHOLD"
+
+    loc_conf = "HIGH"
+    if dfp["lat"].isna().any() or dfp["lon"].isna().any():
+        loc_conf = "LOW"
+
+    meteo_source = ""
+    if "source" in dfp.columns:
+        try:
+            meteo_source = str(dfp["source"].mode(dropna=True).iloc[0])
+        except Exception:
+            meteo_source = ""
+
+    met = {
+        "point_id": point_id,
+        "resource_type": resource_type,
+        "unit": unit,
+        "status": status,
+        "reason": reason,
+        "warnings": ";".join(warnings) if warnings else "",
+        "decision": decision,
+        "selected_family": selected,
+        "planning_horizon": int(planning_h[selected]),
+        "advisory_horizon": int(advisory_h[selected]),
+        "planning_kge_threshold": cfg.planning_kge,
+        "advisory_kge_threshold": cfg.advisory_kge,
+        "cutoff_date": str(cutoff.date()),
+        "last_observed_date": str(last_date.date()),
+        "location_confidence": loc_conf,
+        "meteo_source": meteo_source,
+    }
+
+    for fam in families:
+        for h in cfg.horizons:
+            met[f"kge_{fam.lower()}_{h}"] = kge_by_family[fam].get(h, np.nan)
+
+    metrics_df = pd.DataFrame([met])
+
+    # -----------------------------
+    # Final forecasts from last_date + confidence grade per horizon
+    # -----------------------------
+    forecasts = []
+    for h in cfg.horizons:
+        k_sel = kge_by_family[selected].get(h, np.nan)
+        conf = grade_from_kge(k_sel, cfg.planning_kge, cfg.advisory_kge)
+
+        if selected == "BASELINE_SEASONAL":
+            y_hat = seasonal_baseline(dfp[["date", "value"]], last_date, h)
+            forecasts.append(
+                {
+                    "date": str((last_date + pd.DateOffset(months=h)).date()),
+                    "horizon": h,
+                    "y_forecast": y_hat,
+                    "point_id": point_id,
+                    "resource_type": resource_type,
+                    "unit": unit,
+                    "family": selected,
+                    "model_type": "",
+                    "kge_backtest": k_sel,
+                    "confidence_grade": conf,
+                    "exog_future_mode": "",
+                }
+            )
+        else:
+            model = model_info[selected][0]
+            model_type = model_info[selected][1]
+            y_hat = recursive_forecast_delta(
+                model=model,
+                history=dfp[["date", "value"]],
+                exog_df=exog_df,
+                start_date=last_date,
+                horizon=h,
+                family=selected,
+            )
+            forecasts.append(
+                {
+                    "date": str((last_date + pd.DateOffset(months=h)).date()),
+                    "horizon": h,
+                    "y_forecast": y_hat,
+                    "point_id": point_id,
+                    "resource_type": resource_type,
+                    "unit": unit,
+                    "family": selected,
+                    "model_type": model_type,
+                    "kge_backtest": k_sel,
+                    "confidence_grade": conf,
+                    "exog_future_mode": "CLIMATOLOGY" if selected == "EXOG_ML" else "",
+                }
+            )
+
+    forecasts_df = pd.DataFrame(forecasts)
+    return metrics_df, skill_df, forecasts_df
 
 
 def main() -> None:
-    args = parse_args()
-    horizons = tuple(int(x.strip()) for x in args.horizons.split(",") if x.strip())
+    ap = argparse.ArgumentParser(description="BasinCast Core v0.6.1 (warning-free + confidence per horizon).")
+    ap.add_argument("--input", required=True, help="Path to canonical_with_meteo.csv (or canonical without meteo)")
+    ap.add_argument("--outdir", default="outputs", help="Output folder")
+    ap.add_argument("--holdout_months", type=int, default=96)
+    ap.add_argument("--inner_val_months", type=int, default=36)
+    args = ap.parse_args()
 
-    cfg = PipelineConfig(
-        horizons=horizons,
-        test_months=int(args.test_months),
-        val_months=int(args.val_months),
-        min_history_months=int(args.min_history_months),
-        min_train_months=int(args.min_train_months),
-        planning_kge_threshold=float(args.planning_kge),
-        advisory_kge_threshold=float(args.advisory_kge),
-        min_pairs_per_horizon=int(args.min_pairs),
+    inp = Path(args.input)
+    if not inp.exists():
+        raise FileNotFoundError(inp)
+
+    df = pd.read_csv(inp)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df = df.sort_values(["point_id", "date"]).reset_index(drop=True)
+
+    required = {"point_id", "date", "value", "resource_type", "unit"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required canonical columns: {sorted(missing)}")
+
+    cfg = RunConfig(
+        horizons=[12, 24, 36, 48],
+        holdout_months=args.holdout_months,
+        inner_val_months=args.inner_val_months,
     )
 
-    forecasts_df, metrics_df, skill_df = run_pipeline(
-        canonical_csv=Path(args.input),
-        outdir=Path(args.outdir),
-        cfg=cfg,
-    )
+    all_metrics = []
+    all_skill = []
+    all_fc = []
 
-    print("BasinCast Core v0.5.2 ✅")
-    print(f"Forecasts rows: {len(forecasts_df)}")
-    print(f"Metrics rows:   {len(metrics_df)}")
-    print(f"Skill rows:     {len(skill_df)}")
-    print(f"Saved: {Path(args.outdir) / 'forecasts_v0_5_2.csv'}")
-    print(f"Saved: {Path(args.outdir) / 'metrics_v0_5_2.csv'}")
-    print(f"Saved: {Path(args.outdir) / 'skill_by_horizon_v0_5_2.csv'}")
+    for _, g in df.groupby("point_id", sort=True):
+        m, s, f = run_point(g, cfg)
+        all_metrics.append(m)
+        all_skill.append(s)
+        all_fc.append(f)
+
+    metrics_df = pd.concat(all_metrics, ignore_index=True)
+    skill_df = pd.concat(all_skill, ignore_index=True)
+    fc_df = pd.concat(all_fc, ignore_index=True)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    metrics_path = outdir / "metrics_v0_6_1.csv"
+    skill_path = outdir / "skill_v0_6_1.csv"
+    fc_path = outdir / "forecasts_v0_6_1.csv"
+
+    metrics_df.to_csv(metrics_path, index=False)
+    skill_df.to_csv(skill_path, index=False)
+    fc_df.to_csv(fc_path, index=False)
+
+    print("BasinCast Core v0.6.1 ✅")
+    print(f"Metrics rows:   {len(metrics_df)} | Saved: {metrics_path}")
+    print(f"Skill rows:     {len(skill_df)} | Saved: {skill_path}")
+    print(f"Forecasts rows: {len(fc_df)} | Saved: {fc_path}")
+    print(metrics_df.head(1).to_csv(index=False).strip())
 
 
 if __name__ == "__main__":

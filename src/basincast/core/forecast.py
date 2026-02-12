@@ -16,6 +16,21 @@ class ForecastConfig:
     non_negative: bool = True
 
 
+def _safe_predict_1(model: object, X: pd.DataFrame) -> float:
+    """
+    Predict a single value avoiding sklearn feature-name warnings.
+    If the model was trained without feature names, convert X -> numpy.
+    If the model stores feature_names_in_, align columns.
+    """
+    cols = getattr(model, "feature_names_in_", None)
+    if cols is not None:
+        X = X.reindex(columns=list(cols), fill_value=0.0)
+        return float(model.predict(X)[0])
+
+    # Trained without names -> avoid warnings
+    return float(model.predict(X.to_numpy())[0])
+
+
 def forecast_recursive_endo(
     model: object,
     history: pd.DataFrame,
@@ -24,7 +39,7 @@ def forecast_recursive_endo(
     feat_cfg: FeatureConfig = FeatureConfig(),
 ) -> pd.DataFrame:
     """
-    Recursive multi-step forecast in delta space.
+    Recursive multi-step forecast in delta space (ENDO).
 
     history must contain at least: date, value
     start_date is last observed month-start date.
@@ -33,38 +48,46 @@ def forecast_recursive_endo(
       date, horizon, y_forecast, delta_y_pred
     """
     history = history.copy()
-    history["date"] = pd.to_datetime(history["date"], errors="coerce")
+    history["date"] = pd.to_datetime(history["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     history = history.sort_values("date")
 
     max_h = int(max(fc_cfg.horizons))
     feat_cols = get_feature_columns(feat_cfg)
 
-    # Build buffer with last 12 observed levels (for lag12)
     last_values = history["value"].dropna().to_numpy(dtype=float)
     if len(last_values) == 0:
         raise ValueError("Empty history values.")
 
     y_prev = float(last_values[-1])
 
-    # If not enough for lag12, pad using earliest value
+    # lag12 buffer: keep last 12 levels; if insufficient, pad with earliest value
     if len(last_values) >= 12:
         lag12_buffer = deque(last_values[-12:].tolist(), maxlen=12)
     else:
         pad = [float(last_values[0])] * (12 - len(last_values))
         lag12_buffer = deque(pad + last_values.tolist(), maxlen=12)
 
-    delta_prev = 0.0  # first step delta lag1 (policy: repeat_first / 0.0)
+    # Better initial delta lag: last observed delta if available
+    if len(last_values) >= 2:
+        delta_prev = float(last_values[-1] - last_values[-2])
+    else:
+        delta_prev = 0.0
 
     results: List[Dict[str, object]] = []
-    month = int(pd.Timestamp(start_date).month)
+    start_date = pd.Timestamp(start_date).to_period("M").to_timestamp()
 
     for h in range(1, max_h + 1):
-        # Features for step h
+        # forecast date for this step
+        fc_date = (start_date + pd.DateOffset(months=h)).to_period("M").to_timestamp()
+
+        # lags
         value_lag1 = y_prev
         value_lag12 = float(lag12_buffer[0])
 
-        month_sin = np.sin(2 * np.pi * month / 12.0)
-        month_cos = np.cos(2 * np.pi * month / 12.0)
+        # IMPORTANT: seasonality must match forecast month (fc_date), not start_date
+        month = int(fc_date.month)
+        month_sin = float(np.sin(2 * np.pi * month / 12.0))
+        month_cos = float(np.cos(2 * np.pi * month / 12.0))
 
         row = {
             "value_lag1": value_lag1,
@@ -77,13 +100,11 @@ def forecast_recursive_endo(
             row["month_cos"] = month_cos
 
         X = pd.DataFrame([row], columns=feat_cols)
-        delta_pred = float(model.predict(X)[0])
+        delta_pred = _safe_predict_1(model, X)
 
         y_fc = y_prev + delta_pred
         if fc_cfg.non_negative:
             y_fc = max(0.0, y_fc)
-
-        fc_date = (pd.Timestamp(start_date) + pd.DateOffset(months=h)).to_period("M").to_timestamp()
 
         if h in fc_cfg.horizons:
             results.append(
@@ -95,10 +116,9 @@ def forecast_recursive_endo(
                 }
             )
 
-        # Update buffers
+        # update buffers
         lag12_buffer.append(y_fc)
         delta_prev = delta_pred
         y_prev = y_fc
-        month = (month % 12) + 1
 
     return pd.DataFrame(results)
