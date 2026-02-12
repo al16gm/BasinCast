@@ -1,175 +1,196 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 
 
 @dataclass(frozen=True)
-class QualityConfig:
-    planning_kge_threshold: float = 0.6
-    advisory_kge_threshold: float = 0.3
-    min_pairs_per_horizon: int = 24
-    non_negative: bool = True
+class SelectionResult:
+    selected_family: str
+    decision: str
+    status: str
+    reason: str
+
+    # horizons for reporting (per family)
+    per_family_planning_horizon: Dict[str, int]
+    per_family_advisory_horizon: Dict[str, int]
+
+    # horizons for selected family
+    planning_horizon_selected: int
+    advisory_horizon_selected: int
+
+    # for transparent tie-breaking
+    decisive_horizon: int
+    decisive_kge: float
+    decisive_rmse: float
 
 
-def to_month_start(s: pd.Series) -> pd.Series:
-    d = pd.to_datetime(s, errors="coerce")
-    return d.dt.to_period("M").dt.to_timestamp()
-
-
-def clean_monthly_series(df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
-    """
-    Cleans a single point series:
-      - forces month-start dates
-      - resolves duplicate dates by mean(value)
-      - sorts chronologically
-      - reports missing months count (does NOT fill)
-    Expected columns: date, value
-    """
-    warnings: List[str] = []
-    out = df.copy()
-
-    out["date"] = to_month_start(out["date"])
-    out = out.dropna(subset=["date"]).copy()
-
-    # Coerce value numeric (comma/dot)
-    if "value" in out.columns:
-        out["value"] = (
-            out["value"]
-            .astype(str)
-            .str.replace(",", ".", regex=False)
-        )
-        out["value"] = pd.to_numeric(out["value"], errors="coerce")
-
-    out = out.dropna(subset=["value"]).copy()
-    out = out.sort_values("date")
-
-    # Handle duplicates by averaging
-    if out["date"].duplicated().any():
-        warnings.append("DUPLICATE_DATES_AVERAGED")
-        out = out.groupby("date", as_index=False)["value"].mean()
-        out = out.sort_values("date")
-
-    # Missing months diagnostic
-    if len(out) >= 2:
-        full_idx = pd.date_range(out["date"].min(), out["date"].max(), freq="MS")
-        missing = len(full_idx) - out["date"].nunique()
-        if missing > 0:
-            warnings.append(f"MISSING_MONTHS={missing}")
-
-    return out, warnings
-
-
-def horizons_supported_by_holdout(holdout_months: int, horizons: List[int], min_pairs: int) -> tuple[List[int], List[int]]:
-    """
-    For each horizon h, n_pairs = holdout_months - h.
-    Supported if n_pairs >= min_pairs.
-    Returns (supported, unsupported)
-    """
-    supported, unsupported = [], []
-    for h in horizons:
-        n_pairs = holdout_months - int(h)
-        if n_pairs >= min_pairs:
-            supported.append(int(h))
-        else:
-            unsupported.append(int(h))
-    return supported, unsupported
-
-
-def compute_grade_horizons(
-    skill_df: pd.DataFrame,
-    family: str,
-    qc: QualityConfig,
-    horizons: List[int],
-) -> tuple[int, int]:
-    """
-    Returns:
-      planning_horizon: max h with KGE>=planning threshold and enough pairs
-      advisory_horizon: max h with KGE>=advisory threshold and enough pairs
-    """
-    if skill_df.empty:
-        return 0, 0
-
-    fam = skill_df[skill_df["family"] == family].copy()
-    if fam.empty:
-        return 0, 0
-
-    planning = 0
-    advisory = 0
-
-    for h in sorted(horizons):
-        row = fam[fam["horizon"] == int(h)]
-        if row.empty:
-            continue
-        n_pairs = int(row["n_pairs"].iloc[0])
-        kgeh = row["kge"].iloc[0]
-        if n_pairs < qc.min_pairs_per_horizon or not np.isfinite(kgeh):
-            continue
-        if float(kgeh) >= qc.advisory_kge_threshold:
-            advisory = int(h)
-        if float(kgeh) >= qc.planning_kge_threshold:
-            planning = int(h)
-
-    return planning, advisory
-
-
-def choose_decision(
-    ml_planning: int,
-    ml_advisory: int,
-    bl_planning: int,
-    bl_advisory: int,
-) -> tuple[str, str]:
-    """
-    Returns (decision, selected_family)
-    decision in:
-      MODEL_PLANNING, BASELINE_PLANNING, MODEL_ADVISORY, BASELINE_ADVISORY, NOT_RELIABLE
-    """
-    if ml_planning > 0:
-        return "MODEL_PLANNING", "ENDO_ML"
-    if bl_planning > 0:
-        return "BASELINE_PLANNING", "BASELINE_SEASONAL"
-    if ml_advisory > 0:
-        return "MODEL_ADVISORY", "ENDO_ML"
-    if bl_advisory > 0:
-        return "BASELINE_ADVISORY", "BASELINE_SEASONAL"
-    return "NOT_RELIABLE", "NONE"
-
-
-def seasonal_baseline_value(history: pd.DataFrame, start_date: pd.Timestamp, horizon: int) -> float:
-    """
-    Seasonal persistence baseline:
-      y(t+h) = y(t + h - 12) for h<=12, else repeat 12-month cycle recursively.
-    If missing, fallback to last observed.
-    """
-    h = int(horizon)
-    hist = history.copy()
-    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    hist = hist.dropna(subset=["date", "value"]).sort_values("date")
-    if hist.empty:
+def _safe_float(x: object) -> float:
+    try:
+        v = float(x)
+        return v
+    except Exception:
         return float("nan")
 
-    hist_map = dict(zip(hist["date"].tolist(), hist["value"].astype(float).tolist()))
-    last_obs = float(hist["value"].iloc[-1])
 
-    def rec(k: int) -> float:
-        if k <= 12:
-            d = (pd.Timestamp(start_date) + pd.DateOffset(months=k - 12)).to_period("M").to_timestamp()
-            v = hist_map.get(d, last_obs)
-            return float(v)
-        return rec(k - 12)
-
-    return rec(h)
+def _planning_horizon_from_kge(kges: Dict[int, float], threshold: float) -> int:
+    ok = []
+    for h, v in kges.items():
+        v = _safe_float(v)
+        if not np.isnan(v) and v >= threshold:
+            ok.append(int(h))
+    return max(ok) if ok else 0
 
 
-def baseline_forecast(history: pd.DataFrame, start_date: pd.Timestamp, horizons: List[int], non_negative: bool = True) -> pd.DataFrame:
-    rows = []
-    for h in horizons:
-        d = (pd.Timestamp(start_date) + pd.DateOffset(months=int(h))).to_period("M").to_timestamp()
-        y = float(seasonal_baseline_value(history, pd.Timestamp(start_date), int(h)))
-        if non_negative and np.isfinite(y):
-            y = max(0.0, y)
-        rows.append({"date": d, "horizon": int(h), "y_forecast": y})
-    return pd.DataFrame(rows)
+def _decisive_horizon(planning_h: int, advisory_h: int) -> int:
+    # planning dominates; if no planning, use advisory; else 0
+    if planning_h > 0:
+        return int(planning_h)
+    if advisory_h > 0:
+        return int(advisory_h)
+    return 0
+
+
+def _value_at(d: Dict[int, float], h: int) -> float:
+    return _safe_float(d.get(int(h), float("nan")))
+
+
+def select_family(
+    skill_df: pd.DataFrame | None = None,
+    *,
+    kge_by_family: Dict[str, Dict[int, float]] | None = None,
+    rmse_by_family: Dict[str, Dict[int, float]] | None = None,
+    horizons: Tuple[int, ...] | List[int] | None = None,
+    planning_kge_threshold: float = 0.6,
+    advisory_kge_threshold: float = 0.3,
+) -> Dict[str, object]:
+    """
+    Select best family following BasinCast decision rules:
+
+    1) Maximize PLANNING horizon (max h with KGE>=planning threshold)
+    2) If no planning: maximize ADVISORY horizon (max h with KGE>=advisory threshold)
+    3) If tie: choose higher KGE at the decisive horizon (planning or advisory horizon)
+    4) If tie: choose lower RMSE at the decisive horizon
+    5) If tie: prefer BASELINE* (conservative)
+    """
+
+    def _safe_float(x: object) -> float:
+        try:
+            v = float(x)
+            return v
+        except Exception:
+            return float("nan")
+
+    def _planning_horizon_from_kges(kges: Dict[int, float], thr: float) -> int:
+        ok = []
+        for h, v in kges.items():
+            vv = _safe_float(v)
+            if not np.isnan(vv) and vv >= thr:
+                ok.append(int(h))
+        return max(ok) if ok else 0
+
+    def _value_at(d: Dict[int, float], h: int) -> float:
+        return _safe_float(d.get(int(h), float("nan")))
+
+    # -------- Build dictionaries from skill_df if provided --------
+    if skill_df is not None:
+        if not {"family", "horizon", "kge", "rmse"}.issubset(set(skill_df.columns)):
+            raise ValueError("skill_df must contain columns: family, horizon, kge, rmse")
+
+        fams = [str(x) for x in skill_df["family"].unique().tolist()]
+        kge_by_family = {f: {} for f in fams}
+        rmse_by_family = {f: {} for f in fams}
+
+        for _, row in skill_df.iterrows():
+            f = str(row["family"])
+            h = int(row["horizon"])
+            kge_by_family[f][h] = _safe_float(row["kge"])
+            rmse_by_family[f][h] = _safe_float(row["rmse"])
+
+        if horizons is None:
+            horizons = tuple(sorted({int(h) for h in skill_df["horizon"].unique().tolist()}))
+
+    # -------- Validate inputs --------
+    if kge_by_family is None or rmse_by_family is None:
+        raise ValueError("Provide either skill_df or (kge_by_family & rmse_by_family).")
+
+    families = list(kge_by_family.keys())
+    if horizons is None:
+        # fallback: union of keys across families
+        hs = set()
+        for f in families:
+            hs |= set(int(h) for h in kge_by_family.get(f, {}).keys())
+        horizons = tuple(sorted(hs)) if hs else (12, 24, 36, 48)
+
+    # -------- Compute planning/advisory horizons per family --------
+    planning_h = {f: _planning_horizon_from_kges(kge_by_family.get(f, {}), planning_kge_threshold) for f in families}
+    advisory_h = {f: _planning_horizon_from_kges(kge_by_family.get(f, {}), advisory_kge_threshold) for f in families}
+
+    best_plan = max(planning_h.values()) if planning_h else 0
+    best_adv = max(advisory_h.values()) if advisory_h else 0
+
+    if best_plan > 0:
+        pool = [f for f in families if planning_h[f] == best_plan]
+        grade = "PLANNING"
+        decisive_h = int(best_plan)
+    elif best_adv > 0:
+        pool = [f for f in families if advisory_h[f] == best_adv]
+        grade = "ADVISORY"
+        decisive_h = int(best_adv)
+    else:
+        # nobody reaches advisory threshold
+        # pick baseline if exists, else first
+        baseline = [f for f in families if f.upper().startswith("BASELINE")]
+        selected = baseline[0] if baseline else families[0]
+        return {
+            "selected_family": selected,
+            "decision": "NOT_RELIABLE",
+            "status": "WARN",
+            "reason": "SKILL_BELOW_ADVISORY_THRESHOLD",
+            "planning_horizon_by_family": planning_h,
+            "advisory_horizon_by_family": advisory_h,
+            "planning_horizon_selected": planning_h.get(selected, 0),
+            "advisory_horizon_selected": advisory_h.get(selected, 0),
+            "decisive_horizon": 0,
+            "decisive_kge_selected": float("nan"),
+            "decisive_rmse_selected": float("nan"),
+        }
+
+    # -------- Tie-break inside pool --------
+    def _rank(f: str) -> tuple:
+        k = _value_at(kge_by_family.get(f, {}), decisive_h)
+        r = _value_at(rmse_by_family.get(f, {}), decisive_h)
+        # NaNs: push to worst
+        k_sort = -1e12 if np.isnan(k) else float(k)
+        r_sort = 1e12 if np.isnan(r) else float(r)
+        baseline_bonus = 1 if f.upper().startswith("BASELINE") else 0
+        # sort descending: higher KGE, lower RMSE, baseline bonus
+        return (k_sort, -r_sort, baseline_bonus)
+
+    selected = sorted(pool, key=_rank, reverse=True)[0]
+
+    is_baseline = selected.upper().startswith("BASELINE")
+    if grade == "PLANNING":
+        decision = "BASELINE_PLANNING" if is_baseline else "MODEL_PLANNING"
+        status = "OK"
+        reason = ""
+    else:
+        decision = "BASELINE_ADVISORY" if is_baseline else "MODEL_ADVISORY"
+        status = "WARN"
+        reason = "ONLY_ADVISORY_GRADE"
+
+    return {
+        "selected_family": selected,
+        "decision": decision,
+        "status": status,
+        "reason": reason,
+        "planning_horizon_by_family": planning_h,
+        "advisory_horizon_by_family": advisory_h,
+        "planning_horizon_selected": planning_h.get(selected, 0),
+        "advisory_horizon_selected": advisory_h.get(selected, 0),
+        "decisive_horizon": decisive_h,
+        "decisive_kge_selected": _value_at(kge_by_family.get(selected, {}), decisive_h),
+        "decisive_rmse_selected": _value_at(rmse_by_family.get(selected, {}), decisive_h),
+    }
