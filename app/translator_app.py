@@ -32,7 +32,7 @@ from basincast.translator.meteo import (
 
 from basincast.translator.i18n import language_selector, tr
 
-APP_VERSION = "v0.7"
+APP_VERSION = "v0.8"
 
 st.set_page_config(page_title=f"BasinCast Translator ({APP_VERSION})", layout="wide")
 
@@ -107,6 +107,47 @@ def temporal_integrity_reports(canonical: pd.DataFrame) -> tuple[pd.DataFrame, p
     missing_months = pd.DataFrame(missing_records)
     return dup_rows, missing_months
 
+def aggregate_to_monthly_canonical(canonical_with_raw: pd.DataFrame, value_policy: str) -> pd.DataFrame:
+    """
+    canonical_with_raw: must include columns:
+      point_id, date (month start), value, unit, resource_type, lat, lon, date_raw
+    value_policy: LAST | MEAN | SUM
+    """
+    c = canonical_with_raw.copy()
+    c["date"] = pd.to_datetime(c["date"], errors="coerce")
+    c["date_raw"] = pd.to_datetime(c["date_raw"], errors="coerce")
+
+    keys = ["point_id", "date"]
+
+    # Helper for "first non-null"
+    def first_valid(s: pd.Series):
+        s2 = s.dropna()
+        return s2.iloc[0] if len(s2) else np.nan
+
+    if value_policy.upper() == "LAST":
+        # take last row within (point_id, month) according to date_raw
+        c = c.sort_values(["point_id", "date", "date_raw"])
+        idx = c.groupby(keys, sort=False)["date_raw"].idxmax()
+        out = c.loc[idx].copy()
+    else:
+        agg = {
+            "unit": first_valid,
+            "resource_type": first_valid,
+            "lat": first_valid,
+            "lon": first_valid,
+            "date_raw": "max",
+        }
+        if value_policy.upper() == "MEAN":
+            agg["value"] = "mean"
+        elif value_policy.upper() == "SUM":
+            agg["value"] = "sum"
+        else:
+            raise ValueError(f"Unknown value_policy: {value_policy}")
+
+        out = c.groupby(keys, as_index=False).agg(agg)
+
+    out = out.sort_values(["point_id", "date"]).reset_index(drop=True)
+    return out
 
 # -----------------------------
 # Session defaults
@@ -184,6 +225,7 @@ with st.expander(tr("Opciones avanzadas (solo si falla el parsing)", "Advanced o
 
 date_parsed, date_rep = parse_date_series(df[main_date_col], date_hint=date_hint)
 date_month = coerce_month_start(date_parsed)
+date_raw = pd.to_datetime(date_parsed, errors="coerce")
 
 value_num, value_rep = parse_numeric_series(df[main_value_col], locale_hint=num_hint)
 
@@ -236,6 +278,7 @@ mask_eff = date_month.notna() & value_num.notna()
 df_eff = df.loc[mask_eff].copy()
 df_eff["_date"] = date_month.loc[mask_eff]
 df_eff["_value"] = value_num.loc[mask_eff]
+df_eff["_date_raw"] = date_raw.loc[mask_eff]
 
 st.subheader(tr("3) Resumen de calidad (filas efectivas)", "3) Quality summary on effective rows", LANG))
 n_points = df_eff[main_point_col].nunique() if main_point_col != "(none)" and main_point_col in df_eff.columns else 1
@@ -360,7 +403,51 @@ elif coord_mode == "UTM" or (coord_mode == "Auto" and (not has_latlon) and has_u
     d["lat"] = lat
     d["lon"] = lon
 
-canonical = d[["date", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
+# Guardamos también la fecha original (puede ser diaria)
+d["date_raw"] = pd.to_datetime(d["_date_raw"], errors="coerce")
+
+canonical = d[["date", "date_raw", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
+canonical["date"] = pd.to_datetime(canonical["date"], errors="coerce")
+canonical = canonical.sort_values(["point_id", "date", "date_raw"]).reset_index(drop=True)
+
+# --- 7.1 Temporal harmonization (daily/irregular -> monthly) ---
+st.subheader("7.1) Temporal harmonization (if your data is daily/irregular)")
+
+dup_count = int(canonical.duplicated(subset=["point_id", "date"], keep=False).sum())
+
+if dup_count > 0:
+    st.warning(
+        f"Detected multiple records per month (duplicates by point_id+month): {dup_count}. "
+        "This usually means your input is daily/weekly/irregular. We should aggregate to one value per month."
+    )
+
+    value_policy = st.selectbox(
+        "How should we aggregate your ENDO value to monthly?",
+        ["LAST (recommended for levels/storage)", "MEAN (monthly average)", "SUM (monthly total)"],
+        index=0,
+        key="endo_monthly_policy",
+    )
+
+    do_agg = st.checkbox("✅ Convert to monthly now (recommended)", value=True, key="do_monthly_agg")
+
+    if do_agg:
+        before_rows = len(canonical)
+
+        pol = "LAST"
+        if value_policy.startswith("MEAN"):
+            pol = "MEAN"
+        elif value_policy.startswith("SUM"):
+            pol = "SUM"
+
+        canonical = aggregate_to_monthly_canonical(canonical, pol)
+        after_rows = len(canonical)
+
+        st.success(f"Monthly aggregation applied ✅  {before_rows} rows → {after_rows} monthly rows")
+else:
+    st.success("Your dataset already looks monthly (1 row per point_id and month) ✅")
+
+# Ya no necesitamos date_raw en el export final
+canonical = canonical.drop(columns=["date_raw"], errors="ignore")
 canonical = canonical.sort_values(["point_id", "date"]).reset_index(drop=True)
 
 # Store both keys to avoid future mismatches

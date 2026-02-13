@@ -1,69 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
 
-from basincast.meteo.power import PowerMonthlyConfig, fetch_power_monthly
+from basincast.translator.parsing import parse_date_series, parse_numeric_series, coerce_month_start
 
 METEO_COLS = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
-
-
-def to_month_start(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce").dt.to_period("M").dt.to_timestamp()
-
-
-def coerce_float_series(s: pd.Series) -> pd.Series:
-    """
-    Robust numeric parsing for European formats:
-      - "1,23" -> 1.23
-      - "1.234,56" -> 1234.56
-      - "1 234,56" -> 1234.56
-    """
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_numeric(s, errors="coerce")
-
-    x = s.astype(str).str.strip()
-
-    # remove spaces used as thousand separators
-    x = x.str.replace(" ", "", regex=False)
-
-    # if both '.' and ',' exist -> assume '.' thousands and ',' decimal
-    both = x.str.contains(r"\.") & x.str.contains(r",")
-    x.loc[both] = x.loc[both].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-
-    # if only ',' exists -> decimal comma
-    only_comma = x.str.contains(",") & ~x.str.contains(r"\.")
-    x.loc[only_comma] = x.loc[only_comma].str.replace(",", ".", regex=False)
-
-    return pd.to_numeric(x, errors="coerce")
-
-
-def canonical_has_meteo(df: pd.DataFrame) -> bool:
-    return all((c in df.columns) for c in METEO_COLS) and df[METEO_COLS].notna().any().any()
-
-
-def _guess_col(cols: List[str], candidates: List[str]) -> str:
-    lc = {c.lower(): c for c in cols}
-    for cand in candidates:
-        for c in cols:
-            if cand in c.lower():
-                return c
-        if cand.lower() in lc:
-            return lc[cand.lower()]
-    return cols[0] if cols else ""
-
-
-def read_table_from_upload(upload) -> pd.DataFrame:
-    name = (upload.name or "").lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(upload)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(upload)
-    # fallback
-    return pd.read_csv(upload)
 
 
 @dataclass(frozen=True)
@@ -76,6 +21,49 @@ class MeteoMapping:
     point_id_col: str = ""  # optional
 
 
+def to_month_start(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+
+def canonical_has_meteo(canonical: pd.DataFrame) -> bool:
+    return all(c in canonical.columns for c in METEO_COLS)
+
+
+def read_table_from_upload(upload) -> pd.DataFrame:
+    name = getattr(upload, "name", "")
+    if str(name).lower().endswith(".csv"):
+        return pd.read_csv(upload)
+    return pd.read_excel(upload)
+
+
+def _aggregate_meteo_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregation rules:
+      precip -> SUM
+      t2m    -> MEAN
+      tmax   -> MAX
+      tmin   -> MIN
+    """
+    g = df.copy()
+    g["date"] = to_month_start(g["date"])
+
+    def first_valid(s: pd.Series):
+        s2 = s.dropna()
+        return s2.iloc[0] if len(s2) else np.nan
+
+    agg = {
+        "precip_mm_month_est": "sum",
+        "t2m_c": "mean",
+        "tmax_c": "max",
+        "tmin_c": "min",
+        "source": first_valid,
+    }
+
+    out = g.groupby(["point_id", "date"], as_index=False).agg(agg)
+    out = out.sort_values(["point_id", "date"]).reset_index(drop=True)
+    return out
+
+
 def build_user_meteo_table(
     raw: pd.DataFrame,
     canonical_point_ids: List[str],
@@ -84,85 +72,99 @@ def build_user_meteo_table(
     single_point_id: str = "",
 ) -> pd.DataFrame:
     """
+    Builds a canonical meteo table with monthly rows:
+      point_id, date, precip_mm_month_est, t2m_c, tmax_c, tmin_c, source
+
     mode:
-      - "HAS_POINT_ID": raw contains point_id column
-      - "SINGLE_POINT": apply all rows to one selected point
-      - "COMMON_ALL": apply same meteo to every point_id (replicate)
+      - HAS_POINT_ID: raw has point_id column
+      - SINGLE_POINT: raw applies to a single point_id (selected by user)
+      - COMMON_ALL: raw applies to all point_ids equally
     """
     df = raw.copy()
 
-    df["date"] = to_month_start(df[mapping.date_col])
+    # Parse dates robustly
+    date_parsed, _ = parse_date_series(df[mapping.date_col], date_hint="auto")
+    df["_date_raw"] = pd.to_datetime(date_parsed, errors="coerce")
+    df["date"] = coerce_month_start(df["_date_raw"])
 
-    df["precip_mm_month_est"] = coerce_float_series(df[mapping.precip_col])
-    df["t2m_c"] = coerce_float_series(df[mapping.t2m_col])
-    df["tmax_c"] = coerce_float_series(df[mapping.tmax_col])
-    df["tmin_c"] = coerce_float_series(df[mapping.tmin_col])
+    # Parse numeric columns robustly (accept comma/dot)
+    p, _ = parse_numeric_series(df[mapping.precip_col], locale_hint="auto")
+    t2m, _ = parse_numeric_series(df[mapping.t2m_col], locale_hint="auto")
+    tmax, _ = parse_numeric_series(df[mapping.tmax_col], locale_hint="auto")
+    tmin, _ = parse_numeric_series(df[mapping.tmin_col], locale_hint="auto")
 
-    out = df[["date"] + METEO_COLS].dropna(subset=["date"]).copy()
-    out["source"] = "USER_UPLOAD"
+    df["precip_mm_month_est"] = p
+    df["t2m_c"] = t2m
+    df["tmax_c"] = tmax
+    df["tmin_c"] = tmin
+    df["source"] = "USER_UPLOAD"
 
     if mode == "HAS_POINT_ID":
         if not mapping.point_id_col:
-            raise ValueError("point_id_col is required for HAS_POINT_ID")
-        out["point_id"] = df[mapping.point_id_col].astype(str)
-        out = out.dropna(subset=["point_id"])
-        return out[["point_id", "date"] + METEO_COLS + ["source"]]
+            raise ValueError("mode=HAS_POINT_ID requires mapping.point_id_col")
+        df["point_id"] = df[mapping.point_id_col].astype(str).str.strip()
 
-    if mode == "SINGLE_POINT":
+    elif mode == "SINGLE_POINT":
         if not single_point_id:
-            raise ValueError("single_point_id is required for SINGLE_POINT")
-        out["point_id"] = str(single_point_id)
-        return out[["point_id", "date"] + METEO_COLS + ["source"]]
+            raise ValueError("mode=SINGLE_POINT requires single_point_id")
+        df["point_id"] = str(single_point_id)
 
-    # COMMON_ALL: replicate to all points
-    reps = []
-    for pid in canonical_point_ids:
-        tmp = out.copy()
-        tmp["point_id"] = str(pid)
-        reps.append(tmp)
-    return pd.concat(reps, ignore_index=True)[["point_id", "date"] + METEO_COLS + ["source"]]
+    elif mode == "COMMON_ALL":
+        # We'll aggregate first as a single series, then replicate to all points
+        df["point_id"] = "COMMON_ALL"
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # Keep only rows where we have a month
+    df = df.dropna(subset=["date"]).copy()
+
+    # Aggregate to monthly (handles daily/irregular automatically)
+    met = _aggregate_meteo_monthly(df[["point_id", "date"] + METEO_COLS + ["source"]])
+
+    if mode == "COMMON_ALL":
+        # replicate monthly meteo to all canonical points
+        met_base = met.drop(columns=["point_id"]).copy()
+        out_all = []
+        for pid in canonical_point_ids:
+            tmp = met_base.copy()
+            tmp["point_id"] = str(pid)
+            out_all.append(tmp)
+        met = pd.concat(out_all, ignore_index=True).sort_values(["point_id", "date"]).reset_index(drop=True)
+
+    # Filter to canonical point ids (safety)
+    met = met[met["point_id"].isin([str(x) for x in canonical_point_ids])].copy()
+
+    return met
 
 
-def ensure_latlon_per_point(canonical: pd.DataFrame) -> pd.DataFrame:
+def fetch_nasa_power_for_canonical(canonical_df: pd.DataFrame):
     """
-    Returns one row per point_id with lat/lon (mode), used for NASA fetch.
+    This function should already exist in your project and call NASA POWER.
+    We keep the signature used by translator_app.
     """
-    need = {"point_id", "lat", "lon"}
-    miss = need - set(canonical.columns)
-    if miss:
-        raise ValueError(f"Canonical missing required columns for NASA fetch: {sorted(miss)}")
+    from basincast.meteo.power import PowerMonthlyConfig, fetch_power_monthly  # existing module
 
-    g = canonical.copy()
-    g["point_id"] = g["point_id"].astype(str)
-    latlon = (
-        g.dropna(subset=["lat", "lon"])
-         .groupby("point_id", as_index=False)[["lat", "lon"]]
-         .agg(lambda s: s.mode(dropna=True).iloc[0] if len(s.mode(dropna=True)) else s.dropna().iloc[0])
+    c = canonical_df.copy()
+    c["date"] = to_month_start(c["date"])
+    c["point_id"] = c["point_id"].astype(str)
+
+    # One lat/lon per point
+    pts = (
+        c.dropna(subset=["lat", "lon"])
+        .groupby("point_id", as_index=False)[["lat", "lon"]]
+        .first()
     )
-    return latlon
 
+    if pts.empty:
+        raise ValueError("No valid lat/lon found in canonical_df.")
 
-def fetch_nasa_power_for_canonical(canonical: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Fetch monthly meteo from NASA POWER for each point_id (using lat/lon),
-    for the date-span of the canonical.
-    Returns:
-      - meteo_df (point_id,date,meteo...,source)
-      - canonical_with_meteo (merged)
-    """
-    df = canonical.copy()
-    df["point_id"] = df["point_id"].astype(str)
-    df["date"] = to_month_start(df["date"])
+    # Determine year span from canonical
+    years = pd.to_datetime(c["date"], errors="coerce").dt.year.dropna().astype(int)
+    start_year = int(years.min())
+    end_year = int(years.max())
 
-    start_year = int(pd.to_datetime(df["date"].min()).year)
-    end_year = int(pd.to_datetime(df["date"].max()).year)
-
-    latlon = ensure_latlon_per_point(df)
-    if latlon.empty:
-        raise ValueError("No valid lat/lon found for any point_id.")
-
-    meteo_all = []
-    for _, row in latlon.iterrows():
+    all_rows = []
+    for _, row in pts.iterrows():
         pid = str(row["point_id"])
         lat = float(row["lat"])
         lon = float(row["lon"])
@@ -174,14 +176,16 @@ def fetch_nasa_power_for_canonical(canonical: pd.DataFrame) -> tuple[pd.DataFram
             cfg=PowerMonthlyConfig(),
         )
         met["point_id"] = pid
-        meteo_all.append(met)
+        all_rows.append(met)
 
-    meteo_df = pd.concat(meteo_all, ignore_index=True)
+    meteo_df = pd.concat(all_rows, ignore_index=True)
     meteo_df["date"] = to_month_start(meteo_df["date"])
+    meteo_df["source"] = "NASA_POWER_MONTHLY"
 
-    merged = df.merge(
+    canonical_with_meteo = c.merge(
         meteo_df[["point_id", "date"] + METEO_COLS + ["source"]],
         on=["point_id", "date"],
         how="left",
     )
-    return meteo_df, merged
+
+    return meteo_df, canonical_with_meteo
