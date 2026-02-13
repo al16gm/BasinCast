@@ -421,12 +421,42 @@ if dup_count > 0:
         "This usually means your input is daily/weekly/irregular. We should aggregate to one value per month."
     )
 
+    # --- Smart default for monthly aggregation ---
+    # If resource_type suggests monthly volumes, default to SUM.
+    resource_guess = ""
+    try:
+        resource_guess = str(canonical["resource_type"].dropna().astype(str).iloc[0]).strip().lower()
+    except Exception:
+        resource_guess = ""
+
+    # Heuristic defaults
+    default_policy_label = "LAST (recommended for levels/storage)"
+    if any(k in resource_guess for k in ["river", "demand", "flow", "inflow", "volume", "hm3", "m3"]):
+        default_policy_label = "SUM (monthly total)"
+    elif any(k in resource_guess for k in ["reservoir", "storage", "level", "stage", "elevation"]):
+        default_policy_label = "LAST (recommended for levels/storage)"
+    else:
+        # unknown -> keep LAST but we will tell user
+        default_policy_label = "LAST (recommended for levels/storage)"
+
+    options = [
+        "LAST (recommended for levels/storage)",
+        "MEAN (monthly average)",
+        "SUM (monthly total)",
+    ]
+    default_index = options.index(default_policy_label) if default_policy_label in options else 0
+
     value_policy = st.selectbox(
         "How should we aggregate your ENDO value to monthly?",
-        ["LAST (recommended for levels/storage)", "MEAN (monthly average)", "SUM (monthly total)"],
-        index=0,
+        options,
+        index=default_index,
         key="endo_monthly_policy",
     )
+
+    if default_policy_label.startswith("SUM"):
+        st.info("ℹ️ Default chosen: **SUM (monthly total)** because your resource looks like a monthly volume series (e.g., River). You can change it above.")
+    elif default_policy_label.startswith("LAST"):
+        st.info("ℹ️ Default chosen: **LAST** because your resource looks like a level/storage-type series. You can change it above.")
 
     do_agg = st.checkbox("✅ Convert to monthly now (recommended)", value=True, key="do_monthly_agg")
 
