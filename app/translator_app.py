@@ -20,6 +20,16 @@ from basincast.translator.normalize import (
     apply_value_map,
 )
 
+from basincast.translator.meteo import (
+    METEO_COLS,
+    MeteoMapping,
+    canonical_has_meteo,
+    read_table_from_upload,
+    build_user_meteo_table,
+    fetch_nasa_power_for_canonical,
+    to_month_start,
+)
+
 st.set_page_config(page_title="BasinCast Translator (v0.4)", layout="wide")
 st.title("BasinCast — Input Translator (v0.4)")
 st.write(
@@ -308,6 +318,15 @@ elif coord_mode == "UTM" or (coord_mode == "Auto" and (not has_latlon) and has_u
 canonical = d[["date", "point_id", "value", "unit", "resource_type", "lat", "lon"]].copy()
 canonical = canonical.sort_values(["point_id", "date"])
 
+st.session_state["canonical"] = canonical
+# Save mapping (optional) only if the variable exists in the current script scope
+try:
+    st.session_state["mapping_json"] = mapping_json
+except NameError:
+    # Some versions name it differently or build mapping later
+    st.session_state["mapping_json"] = None
+
+
 # Integrity reports
 dup_rows, missing_months = temporal_integrity_reports(canonical)
 
@@ -383,6 +402,173 @@ with cB:
             file_name="missing_months.csv",
             mime="text/csv",
         )
+
+import streamlit as st
+import pandas as pd
+
+st.markdown("---")
+st.header("🌦️ Meteorología (opcional)")
+
+if "canonical_df" not in st.session_state:
+    st.info("Primero sube tu fichero y genera el CANONICAL en los pasos anteriores.")
+    st.stop()
+
+canonical_df = st.session_state["canonical_df"].copy()
+canonical_df["date"] = to_month_start(canonical_df["date"])
+canonical_df["point_id"] = canonical_df["point_id"].astype(str)
+
+# 1) Si ya viene meteo en el archivo
+if canonical_has_meteo(canonical_df):
+    st.success("✅ Tu fichero YA contiene meteorología (meteo detectada en el canonical). No hay que hacer nada.")
+    st.session_state["canonical_with_meteo"] = canonical_df
+
+else:
+    st.warning("Tu fichero NO trae meteorología. Vamos a resolverlo con el flujo for dummies.")
+
+    choice = st.radio(
+        "¿Cómo quieres aportar meteorología?",
+        [
+            "A) Puedo subir otro fichero con meteorología histórica",
+            "B) No tengo meteorología → descargar de NASA POWER (sin API key)",
+        ],
+        index=1,
+    )
+
+    # ---------------------------------------
+    # A) Upload meteo
+    # ---------------------------------------
+    if choice.startswith("A)"):
+        st.subheader("A) Subir meteorología histórica (archivo aparte)")
+        meteo_upload = st.file_uploader("Sube CSV/XLSX con meteo", type=["csv", "xlsx", "xls"], key="meteo_upload")
+
+        if meteo_upload is not None:
+            raw = read_table_from_upload(meteo_upload)
+            st.write("Vista previa:")
+            st.dataframe(raw.head(20), use_container_width=True)
+
+            cols = list(raw.columns)
+            if len(cols) < 2:
+                st.error("El fichero meteo no tiene columnas suficientes.")
+                st.stop()
+
+            # guesses
+            date_guess = "date" if "date" in [c.lower() for c in cols] else cols[0]
+            precip_guess = next((c for c in cols if "precip" in c.lower() or "rain" in c.lower()), cols[0])
+            t2m_guess = next((c for c in cols if "t2m" in c.lower() or ("temp" in c.lower() and "max" not in c.lower() and "min" not in c.lower())), cols[0])
+            tmax_guess = next((c for c in cols if "tmax" in c.lower() or "max" in c.lower()), cols[0])
+            tmin_guess = next((c for c in cols if "tmin" in c.lower() or "min" in c.lower()), cols[0])
+            pid_guess = next((c for c in cols if "point" in c.lower() or "id" == c.lower() or "point_id" in c.lower()), "")
+
+            st.markdown("### 🔧 Mapeo de columnas (confirma/corrige)")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                date_col = st.selectbox("Columna FECHA", cols, index=cols.index(date_guess) if date_guess in cols else 0)
+                precip_col = st.selectbox("Columna PRECIP", cols, index=cols.index(precip_guess) if precip_guess in cols else 0)
+            with c2:
+                t2m_col = st.selectbox("Columna T2M", cols, index=cols.index(t2m_guess) if t2m_guess in cols else 0)
+                tmax_col = st.selectbox("Columna TMAX", cols, index=cols.index(tmax_guess) if tmax_guess in cols else 0)
+            with c3:
+                tmin_col = st.selectbox("Columna TMIN", cols, index=cols.index(tmin_guess) if tmin_guess in cols else 0)
+
+            mode = st.radio(
+                "¿Tu fichero meteo identifica el point_id?",
+                ["Sí, tiene point_id", "No: es de un solo punto", "No: es común para todos los puntos"],
+                index=0 if pid_guess else 2,
+            )
+
+            point_id_col = ""
+            single_point = ""
+
+            unique_points = sorted(canonical_df["point_id"].unique().tolist())
+
+            if mode == "Sí, tiene point_id":
+                point_id_col = st.selectbox("Columna POINT_ID", ["(elige)"] + cols, index=(cols.index(pid_guess) + 1) if pid_guess in cols else 0)
+                if point_id_col == "(elige)":
+                    st.error("Selecciona la columna point_id.")
+                    st.stop()
+                mode_key = "HAS_POINT_ID"
+
+            elif mode == "No: es de un solo punto":
+                single_point = st.selectbox("¿Para qué point_id aplica?", unique_points)
+                mode_key = "SINGLE_POINT"
+            else:
+                mode_key = "COMMON_ALL"
+
+            mapping = MeteoMapping(
+                date_col=date_col,
+                precip_col=precip_col,
+                t2m_col=t2m_col,
+                tmax_col=tmax_col,
+                tmin_col=tmin_col,
+                point_id_col=point_id_col if mode_key == "HAS_POINT_ID" else "",
+            )
+
+            if st.button("✅ Aplicar meteorología subida"):
+                try:
+                    meteo_df = build_user_meteo_table(
+                        raw=raw,
+                        canonical_point_ids=unique_points,
+                        mapping=mapping,
+                        mode=mode_key,
+                        single_point_id=single_point,
+                    )
+                    canonical_with_meteo = canonical_df.merge(
+                        meteo_df[["point_id", "date"] + METEO_COLS + ["source"]],
+                        on=["point_id", "date"],
+                        how="left",
+                    )
+
+                    st.session_state["meteo_df"] = meteo_df
+                    st.session_state["canonical_with_meteo"] = canonical_with_meteo
+                    st.success("✅ Meteorología integrada en canonical_with_meteo")
+                except Exception as e:
+                    st.error(f"Error integrando meteorología: {e}")
+
+    # ---------------------------------------
+    # B) NASA POWER
+    # ---------------------------------------
+    else:
+        st.subheader("B) Descargar de NASA POWER (sin API key)")
+
+        if not {"lat", "lon"}.issubset(set(canonical_df.columns)):
+            st.error("Tu canonical no tiene lat/lon. Vuelve al paso de mapeo y asegúrate de incluir coordenadas.")
+            st.stop()
+
+        # check missing coords
+        coords_ok = canonical_df[["lat", "lon"]].notna().all(axis=1).all()
+        if not coords_ok:
+            st.warning("Faltan coordenadas en algunas filas. Rellena lat/lon antes de descargar NASA.")
+
+        if st.button("🌍 Descargar meteorología NASA POWER y crear canonical_with_meteo"):
+            try:
+                with st.spinner("Descargando NASA POWER... (puede tardar 5–30s por punto, queda cacheado)"):
+                    meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(canonical_df)
+
+                st.session_state["meteo_df"] = meteo_df
+                st.session_state["canonical_with_meteo"] = canonical_with_meteo
+                st.success("✅ NASA POWER descargado e integrado en canonical_with_meteo")
+            except Exception as e:
+                st.error(f"Error NASA POWER: {e}")
+
+# Descargas finales
+if "canonical_with_meteo" in st.session_state:
+    st.markdown("### 📥 Descargas")
+    cwm = st.session_state["canonical_with_meteo"]
+    st.download_button(
+        "Download canonical_with_meteo.csv",
+        data=cwm.to_csv(index=False).encode("utf-8"),
+        file_name="canonical_with_meteo.csv",
+        mime="text/csv",
+    )
+
+if "meteo_df" in st.session_state:
+    met = st.session_state["meteo_df"]
+    st.download_button(
+        "Download meteo_power_monthly.csv",
+        data=met.to_csv(index=False).encode("utf-8"),
+        file_name="meteo_power_monthly.csv",
+        mime="text/csv",
+    )
 
 # Mandatory confirmation
 st.write("---")
