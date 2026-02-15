@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from pyproj import CRS, Transformer
+from basincast.meteo.geocode import geocode_place, reverse_geocode
 
 from basincast.translator.reader import load_user_file, summarize_table
 from basincast.translator.infer import infer_mapping, column_missing_pct
@@ -32,7 +33,7 @@ from basincast.translator.meteo import (
 
 from basincast.translator.i18n import language_selector, tr
 
-APP_VERSION = "v0.8"
+APP_VERSION = "v0.10"
 
 st.set_page_config(page_title=f"BasinCast Translator ({APP_VERSION})", layout="wide")
 
@@ -626,49 +627,48 @@ st.download_button(
 # 9) Meteorology (optional)
 # -----------------------------
 st.markdown("---")
-st.header(tr("🌦️ Meteorología (opcional)", "🌦️ Meteorology (optional)", LANG))
+st.header(tr("meteo_header"))
 
 canonical_df = st.session_state["canonical_df"].copy()
 canonical_df["date"] = to_month_start(canonical_df["date"])
 canonical_df["point_id"] = canonical_df["point_id"].astype(str)
 
+# If file already has meteo columns
 if canonical_has_meteo(canonical_df):
-    st.success(tr("✅ Tu fichero YA contiene meteorología. No hay que hacer nada.",
-                  "✅ Your file already contains meteorology. Nothing to do.",
-                  LANG))
+    st.success(tr("meteo_already_present"))
     st.session_state["canonical_with_meteo"] = canonical_df
 
 else:
-    st.warning(tr("Tu fichero NO trae meteorología. Elige una opción:",
-                  "Your file does NOT include meteorology. Choose an option:",
-                  LANG))
+    st.warning(tr("meteo_missing"))
 
     choice = st.radio(
-        tr("¿Cómo quieres aportar meteorología?", "How do you want to provide meteorology?", LANG),
+        tr("meteo_choice_prompt"),
         [
-            tr("A) Puedo subir otro fichero con meteorología histórica", "A) I can upload a meteorology historical file", LANG),
-            tr("B) No tengo meteorología → descargar de NASA POWER (sin API key)", "B) I don't have meteorology → fetch from NASA POWER (no API key)", LANG),
-            tr("C) No tengo meteorología y quiero continuar SOLO con ENDO (menos fiable)", "C) Continue ENDO-only (less reliable)", LANG),
+            tr("meteo_choice_a"),
+            tr("meteo_choice_b"),
+            tr("meteo_choice_c"),
         ],
         index=1,
         key="meteo_choice",
     )
 
-    # A) Upload meteo
-    if choice.startswith("A)") or choice.startswith("A"):
-        st.subheader(tr("A) Subir meteorología histórica (archivo aparte)", "A) Upload historical meteorology (separate file)", LANG))
-        meteo_upload = st.file_uploader(tr("Sube CSV/XLSX con meteo", "Upload CSV/XLSX with meteorology", LANG),
-                                        type=["csv", "xlsx", "xls"], key="meteo_upload")
+    # ---------------------------------------
+    # A) User uploads meteo file
+    # ---------------------------------------
+    if choice == tr("meteo_choice_a"):
+        st.subheader(tr("meteo_a_title"))
+        meteo_upload = st.file_uploader(tr("meteo_a_uploader"), type=["csv", "xlsx", "xls"], key="meteo_upload")
 
         if meteo_upload is not None:
             raw = read_table_from_upload(meteo_upload)
-            st.write(tr("Vista previa:", "Preview:", LANG))
+            st.write(tr("preview"))
             st.dataframe(raw.head(20), use_container_width=True)
 
             cols = list(raw.columns)
             if len(cols) < 2:
-                st.error(tr("El fichero meteo no tiene columnas suficientes.", "Meteorology file has not enough columns.", LANG))
+                st.error(tr("meteo_a_not_enough_cols"))
             else:
+                # guesses
                 met_date_guess = next((c for c in cols if c.lower() in ("date", "fecha")), cols[0])
                 met_precip_guess = next((c for c in cols if "precip" in c.lower() or "rain" in c.lower() or "lluv" in c.lower()), cols[0])
                 met_t2m_guess = next((c for c in cols if "t2m" in c.lower() or ("temp" in c.lower() and "max" not in c.lower() and "min" not in c.lower())), cols[0])
@@ -676,29 +676,20 @@ else:
                 met_tmin_guess = next((c for c in cols if "tmin" in c.lower() or "min" in c.lower()), cols[0])
                 met_pid_guess = next((c for c in cols if "point_id" in c.lower() or c.lower() == "id" or "point" in c.lower()), "")
 
-                st.markdown(tr("### 🔧 Mapeo de columnas (confirma/corrige)", "### 🔧 Column mapping (confirm/fix)", LANG))
+                st.markdown(tr("meteo_mapping_title"))
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    met_date_col = st.selectbox(tr("Columna FECHA", "DATE column", LANG), cols,
-                                                index=cols.index(met_date_guess) if met_date_guess in cols else 0, key="met_date_col")
-                    met_precip_col = st.selectbox(tr("Columna PRECIP", "PRECIP column", LANG), cols,
-                                                  index=cols.index(met_precip_guess) if met_precip_guess in cols else 0, key="met_precip_col")
+                    met_date_col = st.selectbox(tr("meteo_col_date"), cols, index=cols.index(met_date_guess) if met_date_guess in cols else 0, key="met_date_col")
+                    met_precip_col = st.selectbox(tr("meteo_col_precip"), cols, index=cols.index(met_precip_guess) if met_precip_guess in cols else 0, key="met_precip_col")
                 with c2:
-                    met_t2m_col = st.selectbox(tr("Columna T2M", "T2M column", LANG), cols,
-                                               index=cols.index(met_t2m_guess) if met_t2m_guess in cols else 0, key="met_t2m_col")
-                    met_tmax_col = st.selectbox(tr("Columna TMAX", "TMAX column", LANG), cols,
-                                                index=cols.index(met_tmax_guess) if met_tmax_guess in cols else 0, key="met_tmax_col")
+                    met_t2m_col = st.selectbox(tr("meteo_col_t2m"), cols, index=cols.index(met_t2m_guess) if met_t2m_guess in cols else 0, key="met_t2m_col")
+                    met_tmax_col = st.selectbox(tr("meteo_col_tmax"), cols, index=cols.index(met_tmax_guess) if met_tmax_guess in cols else 0, key="met_tmax_col")
                 with c3:
-                    met_tmin_col = st.selectbox(tr("Columna TMIN", "TMIN column", LANG), cols,
-                                                index=cols.index(met_tmin_guess) if met_tmin_guess in cols else 0, key="met_tmin_col")
+                    met_tmin_col = st.selectbox(tr("meteo_col_tmin"), cols, index=cols.index(met_tmin_guess) if met_tmin_guess in cols else 0, key="met_tmin_col")
 
                 mode = st.radio(
-                    tr("¿Tu fichero meteo identifica el point_id?", "Does your meteo file contain point_id?", LANG),
-                    [
-                        tr("Sí, tiene point_id", "Yes, it has point_id", LANG),
-                        tr("No: es de un solo punto", "No: it is for a single point", LANG),
-                        tr("No: es común para todos los puntos", "No: it is common for all points", LANG),
-                    ],
+                    tr("meteo_has_point_id_q"),
+                    [tr("yes_has_point_id"), tr("no_single_point"), tr("no_common_all")],
                     index=0 if met_pid_guess else 2,
                     key="met_mode",
                 )
@@ -707,20 +698,19 @@ else:
                 single_point = ""
                 unique_points = sorted(canonical_df["point_id"].unique().tolist())
 
-                if mode.startswith("Sí") or mode.startswith("Yes"):
+                if mode == tr("yes_has_point_id"):
                     point_id_col = st.selectbox(
-                        tr("Columna POINT_ID", "POINT_ID column", LANG),
+                        tr("meteo_col_point_id"),
                         ["(choose)"] + cols,
                         index=(cols.index(met_pid_guess) + 1) if met_pid_guess in cols else 0,
                         key="met_point_id_col",
                     )
-                    if point_id_col in ("(choose)", "(elige)"):
-                        st.error(tr("Selecciona la columna point_id.", "Select the point_id column.", LANG))
+                    if point_id_col == "(choose)":
+                        st.error(tr("meteo_need_point_id"))
                         st.stop()
                     mode_key = "HAS_POINT_ID"
-                elif "solo" in mode.lower() or "single" in mode.lower():
-                    single_point = st.selectbox(tr("¿Para qué point_id aplica?", "Which point_id does it apply to?", LANG),
-                                                unique_points, key="met_single_point")
+                elif mode == tr("no_single_point"):
+                    single_point = st.selectbox(tr("meteo_for_which_point"), unique_points, key="met_single_point")
                     mode_key = "SINGLE_POINT"
                 else:
                     mode_key = "COMMON_ALL"
@@ -734,7 +724,7 @@ else:
                     point_id_col=point_id_col if mode_key == "HAS_POINT_ID" else "",
                 )
 
-                if st.button(tr("✅ Aplicar meteorología subida", "✅ Apply uploaded meteorology", LANG), key="apply_uploaded_meteo"):
+                if st.button(tr("apply_uploaded_meteo_btn"), key="apply_uploaded_meteo"):
                     try:
                         meteo_df = build_user_meteo_table(
                             raw=raw,
@@ -750,49 +740,180 @@ else:
                         )
                         st.session_state["meteo_df"] = meteo_df
                         st.session_state["canonical_with_meteo"] = canonical_with_meteo
-                        st.success(tr("✅ Meteorología integrada en canonical_with_meteo", "✅ Meteorology integrated into canonical_with_meteo", LANG))
+                        st.success(tr("meteo_integrated_ok"))
                     except Exception as e:
-                        st.error(tr(f"Error integrando meteorología: {e}", f"Error integrating meteorology: {e}", LANG))
+                        st.error(f"{tr('meteo_integrated_err')}: {e}")
 
-    # B) NASA POWER
-    elif choice.startswith("B)") or choice.startswith("B"):
-        st.subheader(tr("B) Descargar de NASA POWER (sin API key)", "B) Fetch from NASA POWER (no API key)", LANG))
+    # ---------------------------------------
+    # B) NASA POWER (needs coords -> if missing, geocode)
+    # ---------------------------------------
+    elif choice == tr("meteo_choice_b"):
+        st.subheader(tr("meteo_b_title"))
 
-        if not {"lat", "lon"}.issubset(set(canonical_df.columns)):
-            st.warning(tr("Tu canonical no tiene lat/lon. Vuelve y mapéalas, o sube meteo, o usa ENDO-only.",
-                          "Your canonical has no lat/lon. Map coordinates, upload meteo, or use ENDO-only.",
-                          LANG))
+        # Build per-point coord status
+        pts = canonical_df.groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
+        pts["coords_ok"] = pts[["lat", "lon"]].notna().all(axis=1)
+        n_ok = int(pts["coords_ok"].sum())
+        n_total = int(len(pts))
+        n_missing = n_total - n_ok
+
+        st.write(tr("meteo_coords_status").format(n_ok=n_ok, n_total=n_total))
+
+        if n_missing > 0:
+            st.warning(tr("meteo_coords_missing").format(n_missing=n_missing))
+            st.dataframe(pts, use_container_width=True)
+
+            st.markdown(tr("meteo_fix_coords_title"))
+
+            # Option 1: global location text
+            global_loc = st.text_input(tr("meteo_global_location"), value="", key="global_loc")
+
+            # Option 2: upload locations file (point_id + location OR lat/lon)
+            loc_upload = st.file_uploader(tr("meteo_locations_upload"), type=["csv", "xlsx", "xls"], key="loc_upload")
+            loc_df = None
+            if loc_upload is not None:
+                loc_df = read_table_from_upload(loc_upload)
+                st.write(tr("preview"))
+                st.dataframe(loc_df.head(20), use_container_width=True)
+
+                cols = list(loc_df.columns)
+                pid_guess = next((c for c in cols if "point" in c.lower() or "id" == c.lower() or "point_id" in c.lower()), cols[0])
+                loc_guess = next((c for c in cols if "loc" in c.lower() or "city" in c.lower() or "municip" in c.lower() or "place" in c.lower() or "name" in c.lower()), "")
+                lat_guess = next((c for c in cols if c.lower() in ("lat", "latitude")), "")
+                lon_guess = next((c for c in cols if c.lower() in ("lon", "longitude", "lng")), "")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    loc_pid_col = st.selectbox(tr("loc_col_point_id"), cols, index=cols.index(pid_guess) if pid_guess in cols else 0, key="loc_pid_col")
+                    loc_text_col = st.selectbox(tr("loc_col_location"), ["(none)"] + cols, index=(cols.index(loc_guess) + 1) if loc_guess in cols else 0, key="loc_text_col")
+                with c2:
+                    loc_lat_col = st.selectbox(tr("loc_col_lat"), ["(none)"] + cols, index=(cols.index(lat_guess) + 1) if lat_guess in cols else 0, key="loc_lat_col")
+                    loc_lon_col = st.selectbox(tr("loc_col_lon"), ["(none)"] + cols, index=(cols.index(lon_guess) + 1) if lon_guess in cols else 0, key="loc_lon_col")
+
+                st.caption(tr("meteo_locations_rule"))
+
+        # Optional: show approximate location if coords OK
+        if n_ok > 0 and st.checkbox(tr("meteo_show_reverse"), value=False, key="rev_geo_chk"):
+            rows = []
+            for _, r in pts[pts["coords_ok"]].head(8).iterrows():  # cap to avoid slow UI
+                rr = reverse_geocode(float(r["lat"]), float(r["lon"]))
+                rows.append(
+                    {
+                        "point_id": r["point_id"],
+                        "lat": r["lat"],
+                        "lon": r["lon"],
+                        "approx_location": rr.label if rr else "",
+                        "confidence": rr.confidence if rr else "",
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        # Fix coords button (if missing)
+        if n_missing > 0 and st.button(tr("meteo_resolve_coords_btn"), key="resolve_coords"):
+            try:
+                pts2 = pts.copy()
+
+                # 1) If locations file provided: use per-point lat/lon or geocode per-point location text
+                if "loc_upload" in st.session_state and st.session_state["loc_upload"] is not None:
+                    if loc_df is None:
+                        loc_df = read_table_from_upload(st.session_state["loc_upload"])
+                    # Rebuild selected cols
+                    loc_pid_col = st.session_state.get("loc_pid_col")
+                    loc_text_col = st.session_state.get("loc_text_col")
+                    loc_lat_col = st.session_state.get("loc_lat_col")
+                    loc_lon_col = st.session_state.get("loc_lon_col")
+
+                    loc_map = {}
+                    for _, rr in loc_df.iterrows():
+                        pid = str(rr.get(loc_pid_col, "")).strip()
+                        if not pid:
+                            continue
+
+                        latv = None
+                        lonv = None
+
+                        if loc_lat_col and loc_lat_col != "(none)" and loc_lon_col and loc_lon_col != "(none)":
+                            try:
+                                latv = float(str(rr.get(loc_lat_col)).replace(",", "."))
+                                lonv = float(str(rr.get(loc_lon_col)).replace(",", "."))
+                            except Exception:
+                                latv = lonv = None
+
+                        if (latv is None or lonv is None) and loc_text_col and loc_text_col != "(none)":
+                            q = str(rr.get(loc_text_col, "")).strip()
+                            gr = geocode_place(q) if q else None
+                            if gr:
+                                latv, lonv = gr.lat, gr.lon
+
+                        if latv is not None and lonv is not None:
+                            loc_map[pid] = (latv, lonv)
+
+                    # apply map
+                    def _fill(row):
+                        if row["coords_ok"]:
+                            return row
+                        pid = str(row["point_id"])
+                        if pid in loc_map:
+                            row["lat"] = loc_map[pid][0]
+                            row["lon"] = loc_map[pid][1]
+                            row["coords_ok"] = True
+                        return row
+
+                    pts2 = pts2.apply(_fill, axis=1)
+
+                # 2) If still missing, apply global location
+                still_missing = pts2[~pts2["coords_ok"]]
+                if not still_missing.empty:
+                    gl = (st.session_state.get("global_loc") or "").strip()
+                    if gl:
+                        gr = geocode_place(gl)
+                        if gr:
+                            pts2.loc[~pts2["coords_ok"], "lat"] = gr.lat
+                            pts2.loc[~pts2["coords_ok"], "lon"] = gr.lon
+                            pts2["coords_ok"] = pts2[["lat", "lon"]].notna().all(axis=1)
+
+                # Update canonical_df lat/lon per point_id
+                pt_lookup = dict(zip(pts2["point_id"].astype(str), zip(pts2["lat"], pts2["lon"])))
+                canonical_df2 = canonical_df.copy()
+                canonical_df2["lat"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[0])
+                canonical_df2["lon"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[1])
+
+                st.session_state["canonical_df"] = canonical_df2
+                st.success(tr("meteo_coords_resolved_ok"))
+                st.rerun()
+            except Exception as e:
+                st.error(f"{tr('meteo_coords_resolved_err')}: {e}")
+
+        # Now NASA POWER button (only if coords ok)
+        pts3 = st.session_state["canonical_df"].groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
+        coords_ok_all = pts3[["lat", "lon"]].notna().all(axis=1).all()
+
+        if coords_ok_all:
+            if st.button(tr("meteo_fetch_nasa_btn"), key="fetch_nasa_power"):
+                try:
+                    with st.spinner(tr("meteo_fetching_spinner")):
+                        meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(st.session_state["canonical_df"])
+                    st.session_state["meteo_df"] = meteo_df
+                    st.session_state["canonical_with_meteo"] = canonical_with_meteo
+                    st.success(tr("meteo_nasa_ok"))
+                except Exception as e:
+                    st.error(f"{tr('meteo_nasa_err')}: {e}")
         else:
-            coords_ok = canonical_df[["lat", "lon"]].notna().all(axis=1).all()
-            if not coords_ok:
-                st.warning(tr("Faltan coordenadas en algunas filas. NASA POWER requiere lat/lon completos.",
-                              "Some coordinates are missing. NASA POWER requires complete lat/lon.",
-                              LANG))
-            else:
-                if st.button(tr("🌍 Descargar NASA POWER y crear canonical_with_meteo", "🌍 Fetch NASA POWER and build canonical_with_meteo", LANG),
-                             key="fetch_nasa_power"):
-                    try:
-                        with st.spinner(tr("Descargando NASA POWER... (se cachea)", "Fetching NASA POWER... (cached)", LANG)):
-                            meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(canonical_df)
-                        st.session_state["meteo_df"] = meteo_df
-                        st.session_state["canonical_with_meteo"] = canonical_with_meteo
-                        st.success(tr("✅ NASA POWER integrado en canonical_with_meteo", "✅ NASA POWER integrated into canonical_with_meteo", LANG))
-                    except Exception as e:
-                        st.error(tr(f"Error NASA POWER: {e}", f"NASA POWER error: {e}", LANG))
+            st.info(tr("meteo_need_coords_or_other_option"))
 
-    # C) ENDO-only
+    # ---------------------------------------
+    # C) ENDO only
+    # ---------------------------------------
     else:
-        st.info(tr("Continuando SOLO con ENDO. Menos fiable, pero funciona.",
-                   "Continuing ENDO-only. Less reliable, but it works.",
-                   LANG))
+        st.info(tr("meteo_endo_only_info"))
         st.session_state["canonical_with_meteo"] = canonical_df.copy()
 
-# Downloads for meteo outputs
+# Downloads
 if "canonical_with_meteo" in st.session_state:
-    st.markdown(tr("### 📥 Descargas (Meteorología)", "### 📥 Downloads (Meteorology)", LANG))
+    st.markdown("### 📥 Downloads")
     cwm = st.session_state["canonical_with_meteo"]
     st.download_button(
-        tr("Descargar canonical_with_meteo.csv", "Download canonical_with_meteo.csv", LANG),
+        tr("download_canonical_with_meteo"),
         data=cwm.to_csv(index=False).encode("utf-8"),
         file_name="canonical_with_meteo.csv",
         mime="text/csv",
@@ -801,7 +922,7 @@ if "canonical_with_meteo" in st.session_state:
 if "meteo_df" in st.session_state:
     met = st.session_state["meteo_df"]
     st.download_button(
-        tr("Descargar meteo_power_monthly.csv", "Download meteo_power_monthly.csv", LANG),
+        tr("download_meteo_df"),
         data=met.to_csv(index=False).encode("utf-8"),
         file_name="meteo_power_monthly.csv",
         mime="text/csv",
