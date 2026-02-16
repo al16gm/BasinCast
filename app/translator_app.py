@@ -1219,7 +1219,144 @@ if "meteo_df" in st.session_state:
         mime="text/csv",
     )
 
+# -----------------------------
+# 9.5) Demand (optional) — v0.13.3
+# -----------------------------
+st.markdown("---")
+st.header(tr("📦 Demand (optional)", "📦 Demand (optional)"))
 
+# Base table for exogenous integration = canonical_with_meteo if available, else canonical_df
+base_exog = None
+if "canonical_with_meteo" in st.session_state and st.session_state["canonical_with_meteo"] is not None:
+    base_exog = st.session_state["canonical_with_meteo"].copy()
+else:
+    base_exog = st.session_state["canonical_df"].copy()
+
+base_exog["date"] = to_month_start(base_exog["date"])
+base_exog["point_id"] = base_exog["point_id"].astype(str)
+
+demand_choice = st.radio(
+    tr("Your file does NOT include demand. Choose an option:",
+       "Your file does NOT include demand. Choose an option:"),
+    [
+        tr("A) I can upload a historical demand file", "A) I can upload a historical demand file"),
+        tr("B) I don't have demand → continue without demand", "B) I don't have demand → continue without demand"),
+        # Placeholder for v0.14+
+        tr("C) Open data (planned) → not implemented yet", "C) Open data (planned) → not implemented yet"),
+    ],
+    index=1,
+    key="demand_choice",
+)
+
+if demand_choice == tr("A) I can upload a historical demand file", "A) I can upload a historical demand file"):
+    st.subheader(tr("A) Upload demand file", "A) Upload demand file"))
+
+    demand_upload = st.file_uploader(
+        tr("Upload demand file (CSV or Excel)", "Upload demand file (CSV or Excel)"),
+        type=["csv", "xlsx", "xls"],
+        key="demand_upload",
+    )
+
+    if demand_upload is not None:
+        if demand_upload.name.lower().endswith(".csv"):
+            raw_dem = pd.read_csv(demand_upload)
+        else:
+            raw_dem = pd.read_excel(demand_upload)
+
+        st.write(tr("Preview:", "Preview:"))
+        st.dataframe(raw_dem.head(20), use_container_width=True)
+
+        dem_cols = list(raw_dem.columns)
+        if len(dem_cols) < 2:
+            st.error(tr("Demand file must have at least 2 columns (date + value).",
+                        "Demand file must have at least 2 columns (date + value)."))
+        else:
+            dem_date_guess = next((c for c in dem_cols if c.lower() in ("date", "fecha")), dem_cols[0])
+            dem_val_guess = next((c for c in dem_cols if "demand" in c.lower() or "demanda" in c.lower()), dem_cols[1])
+
+            c1, c2 = st.columns(2)
+            with c1:
+                dem_date_col = st.selectbox(
+                    tr("Date column (demand)", "Date column (demand)"),
+                    dem_cols,
+                    index=dem_cols.index(dem_date_guess) if dem_date_guess in dem_cols else 0,
+                    key="dem_date_col",
+                )
+            with c2:
+                dem_val_col = st.selectbox(
+                    tr("Demand value column", "Demand value column"),
+                    dem_cols,
+                    index=dem_cols.index(dem_val_guess) if dem_val_guess in dem_cols else 1,
+                    key="dem_val_col",
+                )
+
+            dem_mode = st.radio(
+                tr("How does demand apply?", "How does demand apply?"),
+                [
+                    tr("COMMON_ALL (same demand for all points)", "COMMON_ALL (same demand for all points)"),
+                    tr("HAS_POINT_ID (demand file has point_id column)", "HAS_POINT_ID (demand file has point_id column)"),
+                ],
+                index=0,
+                key="dem_mode",
+            )
+
+            dem_pid_col = ""
+            if dem_mode == tr("HAS_POINT_ID (demand file has point_id column)", "HAS_POINT_ID (demand file has point_id column)"):
+                dem_pid_guess = next((c for c in dem_cols if "point" in c.lower() or c.lower() in ("id", "point_id")), "")
+                dem_pid_col = st.selectbox(
+                    tr("Point id column (demand)", "Point id column (demand)"),
+                    ["(choose)"] + dem_cols,
+                    index=(dem_cols.index(dem_pid_guess) + 1) if dem_pid_guess in dem_cols else 0,
+                    key="dem_pid_col",
+                )
+                if dem_pid_col == "(choose)":
+                    st.error(tr("Select point id column to use HAS_POINT_ID mode.",
+                                "Select point id column to use HAS_POINT_ID mode."))
+                    st.stop()
+
+            if st.button(tr("✅ Integrate demand into canonical", "✅ Integrate demand into canonical"), key="apply_demand"):
+                try:
+                    ddem = raw_dem[[dem_date_col, dem_val_col] + ([dem_pid_col] if dem_pid_col else [])].copy()
+                    ddem = ddem.rename(columns={dem_date_col: "date", dem_val_col: "demand"})
+                    ddem["date"] = to_month_start(ddem["date"])
+                    ddem["demand"] = pd.to_numeric(ddem["demand"], errors="coerce")
+                    ddem = ddem.dropna(subset=["date", "demand"]).copy()
+
+                    if dem_pid_col:
+                        ddem["point_id"] = ddem[dem_pid_col].astype(str).map(str.strip)
+                        ddem = ddem.groupby(["point_id", "date"], as_index=False)["demand"].mean()
+                        merged = base_exog.merge(ddem[["point_id", "date", "demand"]], on=["point_id", "date"], how="left")
+                    else:
+                        ddem = ddem.groupby(["date"], as_index=False)["demand"].mean()
+                        merged = base_exog.merge(ddem[["date", "demand"]], on=["date"], how="left")
+
+                    n_cov = int(merged["demand"].notna().sum())
+                    st.session_state["canonical_with_meteo_and_demand"] = merged
+                    st.success(tr(f"Demand integrated ✅  Non-null demand rows: {n_cov}",
+                                  f"Demand integrated ✅  Non-null demand rows: {n_cov}"))
+                except Exception as e:
+                    st.error(f"Demand integration failed: {e}")
+
+elif demand_choice == tr("B) I don't have demand → continue without demand", "B) I don't have demand → continue without demand"):
+    st.info(tr("Continuing without demand (ENDO-only or meteo-only).",
+               "Continuing without demand (ENDO-only or meteo-only)."))
+    st.session_state["canonical_with_meteo_and_demand"] = None
+
+else:
+    st.info(tr("Open data demand is planned for v0.14+. Not implemented in v0.13.3.",
+               "Open data demand is planned for v0.14+. Not implemented in v0.13.3."))
+    st.session_state["canonical_with_meteo_and_demand"] = None
+
+# Downloads (if demand integrated)
+if "canonical_with_meteo_and_demand" in st.session_state and st.session_state["canonical_with_meteo_and_demand"] is not None:
+    st.markdown("### 📥 Downloads")
+    cwd = st.session_state["canonical_with_meteo_and_demand"]
+    st.download_button(
+        tr("Download canonical_with_meteo_and_demand.csv", "Download canonical_with_meteo_and_demand.csv"),
+        data=cwd.to_csv(index=False).encode("utf-8"),
+        file_name="canonical_with_meteo_and_demand.csv",
+        mime="text/csv",
+    )
 
 # -----------------------------
 # 10) Run BasinCast + Visualize (v0.12)
@@ -1237,14 +1374,19 @@ if "canonical_df" not in st.session_state:
                 "No canonical_df found in session. Go back and generate the canonical first."))
     st.stop()
 
-# Prefer canonical_with_meteo if present (EXOG possible)
+# Prefer canonical_with_meteo_and_demand > canonical_with_meteo > canonical_df
 df_run = None
 run_mode = "ENDO_ONLY"
-if "canonical_with_meteo" in st.session_state and st.session_state["canonical_with_meteo"] is not None:
+
+if "canonical_with_meteo_and_demand" in st.session_state and st.session_state["canonical_with_meteo_and_demand"] is not None:
+    df_run = st.session_state["canonical_with_meteo_and_demand"].copy()
+    run_mode = "CANONICAL_WITH_METEO_DEMAND"
+elif "canonical_with_meteo" in st.session_state and st.session_state["canonical_with_meteo"] is not None:
     df_run = st.session_state["canonical_with_meteo"].copy()
     run_mode = "CANONICAL_WITH_METEO"
 else:
     df_run = st.session_state["canonical_df"].copy()
+    run_mode = "ENDO_ONLY"
 
 df_run = df_run.copy()
 df_run["date"] = pd.to_datetime(df_run["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
@@ -1466,6 +1608,20 @@ def _paper_leaderboard_from_skill(g_sk: pd.DataFrame, horizons_focus=(1, 12)) ->
     agg["rank"] = np.arange(1, len(agg) + 1)
     return agg
 
+def _to_month_start(s: pd.Series) -> pd.Series:
+    s = pd.to_datetime(s, errors="coerce")
+    return s.dt.to_period("M").dt.to_timestamp()
+
+def _prepare_demand_monthly(demand_df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
+    d = demand_df[[date_col, value_col]].copy()
+    d = d.rename(columns={date_col: "date", value_col: "demand"})
+    d["date"] = _to_month_start(d["date"])
+    d["demand"] = pd.to_numeric(d["demand"], errors="coerce")
+    d = d.dropna(subset=["date", "demand"]).copy()
+    # Aggregate duplicates at month level (mean)
+    d = d.groupby("date", as_index=False)["demand"].mean()
+    d = d.sort_values("date").reset_index(drop=True)
+    return d
 
 def _paper_skill_winner_vs_runnerup(leaderboard: pd.DataFrame) -> tuple[dict, dict]:
     if leaderboard is None or leaderboard.empty:
@@ -1666,6 +1822,57 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             key="zoo_focus"
         )
 
+    # -------------------------
+    # v0.13.3 Demand exogenous mode (like meteo)
+    # -------------------------
+    demand_mode = st.radio(
+        tr("Demanda exógena", "Demand exogenous"),
+        options=[
+            tr("No incluir demanda", "Do not include demand"),
+            tr("Cargar demanda (usuario)", "Upload demand (user)")
+        ],
+        index=0,
+        key="demand_mode"
+    )
+
+    use_demand = (demand_mode == tr("Cargar demanda (usuario)", "Upload demand (user)"))
+
+    demand_df = None
+    demand_date_col = None
+    demand_value_col = None
+
+    if use_demand:
+        demand_file = st.file_uploader(
+            tr("Sube fichero de demanda (CSV o Excel)", "Upload demand file (CSV or Excel)"),
+            type=["csv", "xlsx", "xls"],
+            key="demand_uploader"
+        )
+
+        if demand_file is not None:
+            if demand_file.name.lower().endswith(".csv"):
+                demand_df = pd.read_csv(demand_file)
+            else:
+                demand_df = pd.read_excel(demand_file)
+
+            st.caption(tr("Vista previa demanda:", "Demand preview:"))
+            st.dataframe(demand_df.head(10), use_container_width=True)
+
+            demand_date_col = st.selectbox(
+                tr("Columna fecha (demanda)", "Date column (demand)"),
+                options=list(demand_df.columns),
+                index=0,
+                key="demand_date_col"
+            )
+            demand_value_col = st.selectbox(
+                tr("Columna demanda (valor)", "Demand value column"),
+                options=list(demand_df.columns),
+                index=1 if len(demand_df.columns) > 1 else 0,
+                key="demand_value_col"
+            )
+        else:
+            st.info(tr("Sube un fichero para evaluar EXOG con demanda.", "Upload a file to evaluate EXOG with demand."))
+
+
         if run_zoo:
             # --- Build a clean monthly observed series for this point ---
             # Expected columns in g_obs: ["date","value"] (or similar)
@@ -1676,6 +1883,22 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             obs_df = obs_df[["date", "value"]].copy()
             obs_df["date"] = pd.to_datetime(obs_df["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
             obs_df = obs_df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+            # --- Optional: merge demand as exogenous ---
+            obs_exog = obs_df.copy()
+            has_demand = False
+
+            if use_demand and demand_df is not None and demand_date_col and demand_value_col:
+                try:
+                    d_monthly = _prepare_demand_monthly(demand_df, demand_date_col, demand_value_col)
+                    obs_exog = obs_exog.merge(d_monthly, on="date", how="left")
+                    has_demand = obs_exog["demand"].notna().sum() >= 12  # minimal coverage
+                    st.caption(tr(
+                        f"Demanda integrada: {obs_exog['demand'].notna().sum()} meses con dato.",
+                        f"Demand merged: {obs_exog['demand'].notna().sum()} months with value."
+                    ))
+                except Exception as e:
+                    st.warning(tr(f"No se ha podido preparar la demanda: {e}", f"Could not prepare demand: {e}"))
+                    has_demand = False
 
             # --- Run lightweight zoo backtest (no core changes) ---
             # We implement it here to keep v0.13 safe.
@@ -1709,18 +1932,47 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                 # fallback: last available at origin
                 return float(obs_map.get(origin, hist["value"].iloc[-1]))
 
-            def _make_features(df: pd.DataFrame, lags=(1,2,3,6,12)) -> pd.DataFrame:
+            def _make_features(df: pd.DataFrame, lags=(1,2,3,6,12), use_demand_features: bool=False) -> pd.DataFrame:
                 d = df.copy()
+
+                # target lags
                 for L in lags:
                     d[f"y_lag_{L}"] = d["value"].shift(L)
+
+                # seasonality
                 m = d["date"].dt.month
                 d["month_sin"] = np.sin(2*np.pi*m/12.0)
                 d["month_cos"] = np.cos(2*np.pi*m/12.0)
+
+                # demand lags (EXOG)
+                if use_demand_features and "demand" in d.columns:
+                    d["demand"] = pd.to_numeric(d["demand"], errors="coerce")
+                    for L in lags:
+                        d[f"demand_lag_{L}"] = d["demand"].shift(L)
+
+                    # Optional: short rolling means (robust signal)
+                    d["demand_roll_3"] = d["demand"].rolling(3, min_periods=3).mean()
+                    d["demand_roll_6"] = d["demand"].rolling(6, min_periods=6).mean()
+
                 return d
 
             lags = (1,2,3,6,12)
-            feat = _make_features(obs_df, lags=lags).dropna().reset_index(drop=True)
-            feat_cols = [f"y_lag_{L}" for L in lags] + ["month_sin","month_cos"]
+
+            # ENDO features
+            feat_endo = _make_features(obs_df, lags=lags, use_demand_features=False).dropna().reset_index(drop=True)
+            feat_cols_endo = [f"y_lag_{L}" for L in lags] + ["month_sin","month_cos"]
+
+            # EXOG demand features (only if demand coverage is ok)
+            feat_exog = None
+            feat_cols_exog = None
+            if has_demand:
+                feat_exog = _make_features(obs_exog, lags=lags, use_demand_features=True).dropna().reset_index(drop=True)
+                feat_cols_exog = (
+                    [f"y_lag_{L}" for L in lags]
+                    + ["month_sin","month_cos"]
+                    + [f"demand_lag_{L}" for L in lags]
+                    + ["demand_roll_3", "demand_roll_6"]
+                )
 
             # Rolling origins: last 24 months where training is possible
             min_train = 36
@@ -1746,53 +1998,64 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                 }
 
                 # Collect predictions per model per horizon across origins
+                def _run_family_zoo(family_name: str, feat_df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
+                    rows_local = []
+                    for model_name in ["seasonal_naive"] + list(models.keys()):
+                        for h in zoo_horizons:
+                            sims, obs = [], []
+                            for origin in origins:
+                                target = (origin + pd.DateOffset(months=int(h))).to_period("M").to_timestamp()
+                                obs_row = obs_df.loc[obs_df["date"] == target, "value"]
+                                if len(obs_row) == 0:
+                                    continue
+                                y_true = float(obs_row.iloc[0])
+
+                                try:
+                                    if model_name == "seasonal_naive":
+                                        y_pred = _seasonal_naive_predict(obs_df, origin, int(h))
+                                    else:
+                                        train = feat_df.loc[feat_df["date"] <= origin].copy()
+                                        if len(train) < min_train:
+                                            continue
+                                        X = train[feat_cols].values
+                                        y = train["value"].values
+                                        m = models[model_name]
+                                        m.fit(X, y)
+
+                                        target_row = feat_df.loc[feat_df["date"] == target]
+                                        if len(target_row) == 0:
+                                            continue
+                                        y_pred = float(m.predict(target_row[feat_cols].values)[0])
+
+                                    sims.append(y_pred)
+                                    obs.append(y_true)
+                                except Exception:
+                                    continue
+
+                            score = _kge(np.array(sims), np.array(obs))
+                            rows_local.append({
+                                "model_type": model_name,
+                                "family": family_name,
+                                "horizon": int(h),
+                                "kge": score,
+                                "n_pairs": len(obs)
+                            })
+                    return pd.DataFrame(rows_local)
+
                 rows = []
-                for model_name in ["seasonal_naive"] + list(models.keys()):
-                    for h in zoo_horizons:
-                        sims, obs = [], []
-                        for origin in origins:
-                            target = (origin + pd.DateOffset(months=int(h))).to_period("M").to_timestamp()
-                            obs_row = obs_df.loc[obs_df["date"] == target, "value"]
-                            if len(obs_row) == 0:
-                                continue
-                            y_true = float(obs_row.iloc[0])
+                # ENDO
+                zoo_endo = _run_family_zoo("ENDO_ZOO", feat_endo, feat_cols_endo)
+                rows.append(zoo_endo)
 
-                            try:
-                                if model_name == "seasonal_naive":
-                                    y_pred = _seasonal_naive_predict(obs_df, origin, int(h))
-                                else:
-                                    # train up to origin
-                                    train = feat.loc[feat["date"] <= origin].copy()
-                                    if len(train) < min_train:
-                                        continue
-                                    X = train[feat_cols].values
-                                    y = train["value"].values
-                                    m = models[model_name]
-                                    m.fit(X, y)
+                # EXOG demand (if available)
+                if has_demand and feat_exog is not None and feat_cols_exog is not None:
+                    zoo_exog = _run_family_zoo("EXOG_DEMAND_ZOO", feat_exog, feat_cols_exog)
+                    rows.append(zoo_exog)
+                else:
+                    st.info(tr("EXOG demanda no evaluado (no hay cobertura suficiente).",
+                            "EXOG demand not evaluated (insufficient coverage)."))
 
-                                    # 1-step direct at horizon h (simple and robust):
-                                    # use features at target if available (requires lags observed)
-                                    # if target features not available, skip
-                                    target_row = feat.loc[feat["date"] == target]
-                                    if len(target_row) == 0:
-                                        continue
-                                    y_pred = float(m.predict(target_row[feat_cols].values)[0])
-
-                                sims.append(y_pred)
-                                obs.append(y_true)
-                            except Exception:
-                                continue
-
-                        score = _kge(np.array(sims), np.array(obs))
-                        rows.append({
-                            "model_type": model_name,
-                            "family": "ENDO_ZOO",
-                            "horizon": int(h),
-                            "kge": score,
-                            "n_pairs": int(np.isfinite(score)) and len(obs) or 0
-                        })
-
-                zoo_skill = pd.DataFrame(rows)
+                zoo_skill = pd.concat(rows, ignore_index=True)
                 zoo_skill = zoo_skill.dropna(subset=["kge"]).copy()
 
                 if zoo_skill.empty:
@@ -1804,11 +2067,13 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
 
                     # Leaderboard = mean KGE over focus range
                     hmin, hmax = focus_range
-                    focus = zoo_skill[(zoo_skill["horizon"] >= hmin) & (zoo_skill["horizon"] <= hmax)]
+                    focus = zoo_skill[(zoo_skill["horizon"] >= hmin) & (zoo_skill["horizon"] <= hmax)].copy()
+
                     zoo_leader = (
-                        focus.groupby(["model_type"], as_index=False)
-                            .agg(kge_mean=("kge","mean"), kge_std=("kge","std"), kge_min=("kge","min"), kge_max=("kge","max"))
-                            .sort_values(["kge_mean","kge_min"], ascending=[False, False])
+                        focus.groupby(["family","model_type"], as_index=False)
+                            .agg(kge_mean=("kge","mean"), kge_std=("kge","std"), kge_min=("kge","min"), kge_max=("kge","max"),
+                                n_pairs=("n_pairs","sum"))
+                            .sort_values(["kge_mean","kge_min","n_pairs"], ascending=[False, False, False])
                             .reset_index(drop=True)
                     )
                     zoo_leader["rank"] = np.arange(1, len(zoo_leader)+1)
@@ -1816,7 +2081,8 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                     st.write(tr("Leaderboard (ganador por KGE medio):", "Leaderboard (winner by mean KGE):"))
                     st.dataframe(zoo_leader, use_container_width=True)
 
-                    winner = zoo_leader.iloc[0]["model_type"]
+                    winner_row = zoo_leader.iloc[0]
+                    winner = f"{winner_row['family']} / {winner_row['model_type']}"
                     st.success(tr(f"Ganador automático: {winner}", f"Automatic winner: {winner}"))
 
     # 1) Leaderboard from core skill (best-effort: family + model_type if available)
