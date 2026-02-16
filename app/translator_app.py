@@ -1414,6 +1414,109 @@ def _ensure_monthly_forecast_path(
     return monthly
 
 # -----------------------------
+# Paper-friendly reporting helpers (v0.13)
+# -----------------------------
+def _paper_leaderboard_from_skill(g_sk: pd.DataFrame, horizons_focus=(1, 12)) -> pd.DataFrame:
+    """
+    Build a model leaderboard from core skill table if it contains model_type.
+    Expected columns (best-effort): family, horizon, kge, model_type (optional).
+    If model_type missing, leaderboard will be family-only.
+    """
+    if g_sk is None or g_sk.empty:
+        return pd.DataFrame()
+
+    df = g_sk.copy()
+    if "horizon" in df.columns:
+        df["horizon"] = pd.to_numeric(df["horizon"], errors="coerce")
+    if "kge" in df.columns:
+        df["kge"] = pd.to_numeric(df["kge"], errors="coerce")
+
+    hmin, hmax = horizons_focus
+    if "horizon" in df.columns:
+        df = df[(df["horizon"] >= hmin) & (df["horizon"] <= hmax)].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    group_cols = []
+    if "family" in df.columns:
+        group_cols.append("family")
+    else:
+        df["family"] = "UNKNOWN"
+        group_cols.append("family")
+
+    if "model_type" in df.columns:
+        df["model_type"] = df["model_type"].astype(str)
+        group_cols.append("model_type")
+    else:
+        df["model_type"] = "UNKNOWN"
+
+    agg = (
+        df.groupby(group_cols, as_index=False)
+          .agg(
+              kge_mean=("kge", "mean"),
+              kge_std=("kge", "std"),
+              kge_min=("kge", "min"),
+              kge_max=("kge", "max"),
+              n=("kge", "count"),
+          )
+          .sort_values(["kge_mean", "kge_min"], ascending=[False, False])
+          .reset_index(drop=True)
+    )
+    agg["rank"] = np.arange(1, len(agg) + 1)
+    return agg
+
+
+def _paper_skill_winner_vs_runnerup(leaderboard: pd.DataFrame) -> tuple[dict, dict]:
+    if leaderboard is None or leaderboard.empty:
+        return {}, {}
+    w = leaderboard.iloc[0].to_dict()
+    r = leaderboard.iloc[1].to_dict() if len(leaderboard) > 1 else {}
+    return w, r
+
+
+def _paper_mini_analysis(leaderboard: pd.DataFrame, planning_thr=0.60, advisory_thr=0.30) -> str:
+    if leaderboard is None or leaderboard.empty:
+        return "No leaderboard available (insufficient skill data)."
+
+    w, r = _paper_skill_winner_vs_runnerup(leaderboard)
+    winner = f"{w.get('family','?')} / {w.get('model_type','?')}"
+    msg = f"Winner: {winner}. Mean KGE (focus horizons) = {w.get('kge_mean', np.nan):.3f}."
+
+    if r:
+        runner = f"{r.get('family','?')} / {r.get('model_type','?')}"
+        gap = float(w.get("kge_mean", np.nan)) - float(r.get("kge_mean", np.nan))
+        if np.isfinite(gap):
+            msg += f" Runner-up: {runner} (ΔKGE_mean = {gap:.3f})."
+
+    # simple interpretability flags
+    if float(w.get("kge_mean", -999)) >= planning_thr:
+        msg += f" Strong planning-grade performance (KGE_mean ≥ {planning_thr})."
+    elif float(w.get("kge_mean", -999)) >= advisory_thr:
+        msg += f" Advisory-grade performance (KGE_mean ≥ {advisory_thr})."
+    else:
+        msg += " Low reliability under the current thresholds."
+
+    return msg
+
+
+def _paper_scenario_bands(monthly_fc: pd.DataFrame, favorable_pct=0.05, unfavorable_pct=0.05) -> pd.DataFrame:
+    """
+    Simple scenario conditioning for v0.13:
+    - Base: y_forecast
+    - Favorable: y_forecast*(1+favorable_pct)
+    - Unfavorable: y_forecast*(1-unfavorable_pct)
+    """
+    if monthly_fc is None or monthly_fc.empty:
+        return pd.DataFrame()
+
+    df = monthly_fc.copy()
+    df["scenario_base"] = df["y_forecast"]
+    df["scenario_favorable"] = df["y_forecast"] * (1.0 + float(favorable_pct))
+    df["scenario_unfavorable"] = df["y_forecast"] * (1.0 - float(unfavorable_pct))
+    return df
+
+# -----------------------------
 # UI controls
 # -----------------------------
 c1, c2, c3 = st.columns(3)
@@ -1535,6 +1638,38 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     monthly_fc["horizon"] = pd.to_numeric(monthly_fc["horizon"], errors="coerce").astype("Int64")
     monthly_fc = monthly_fc.dropna(subset=["date", "horizon", "y_forecast"]).sort_values("date")
 
+    # -------------------------
+    # v0.13 Paper-friendly tables + scenarios (NEW)
+    # -------------------------
+    st.subheader(tr("📋 Tablas paper-friendly (por qué gana un modelo)", "📋 Paper-friendly tables (why a model wins)"))
+
+    # 1) Leaderboard from core skill (best-effort: family + model_type if available)
+    leaderboard = _paper_leaderboard_from_skill(g_sk, horizons_focus=(1, 12))
+    if leaderboard.empty:
+        st.info(tr("No puedo construir leaderboard: skill no tiene datos suficientes o no tiene columnas esperadas.",
+                "Cannot build leaderboard: skill table missing required information or too sparse."))
+    else:
+        st.dataframe(leaderboard, use_container_width=True)
+
+        # 2) Mini-analysis (auto)
+        st.caption(_paper_mini_analysis(leaderboard, planning_thr=0.60, advisory_thr=0.30))
+
+        # 3) Also show the raw skill table for transparency
+        with st.expander(tr("Ver skill detallado (transparencia)", "Show detailed skill table (transparency)")):
+            st.dataframe(g_sk.sort_values(["family", "horizon"]) if "family" in g_sk.columns else g_sk, use_container_width=True)
+
+    # 4) Scenarios (simple bands, v0.13)
+    st.subheader(tr("🌦️ Escenarios climáticos (v0.13: bandas simples)", "🌦️ Climate scenarios (v0.13: simple bands)"))
+    fav_pct = st.slider(tr("% favorable", "% favorable"), min_value=0, max_value=30, value=5, step=1) / 100.0
+    unf_pct = st.slider(tr("% unfavorable", "% unfavorable"), min_value=0, max_value=30, value=5, step=1) / 100.0
+
+    scen = _paper_scenario_bands(monthly_fc, favorable_pct=fav_pct, unfavorable_pct=unf_pct)
+    if not scen.empty:
+        st.dataframe(
+            scen[["date", "horizon", "y_forecast", "scenario_unfavorable", "scenario_base", "scenario_favorable"]].head(24),
+            use_container_width=True,
+        )
+
     # Key horizons (12/24/36/48) markers (optional)
     key_horizons = [12, 24, 36, 48]
     key_df = monthly_fc[monthly_fc["horizon"].isin(key_horizons)].copy()
@@ -1549,6 +1684,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
 
     monthly_fc["confidence_class"] = monthly_fc["horizon"].astype(int).map(_klass)
 
+    
     # -------------------------
     # Figure: Observed + monthly forecast (LINES) + key horizons (markers)
     # -------------------------
@@ -1742,6 +1878,21 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         yaxis_title="Value",
         legend_title="Series",
     )
+
+    # Add scenario lines (optional)
+    if "scen" in locals() and scen is not None and not scen.empty:
+        fig.add_trace(go.Scatter(
+            x=scen["date"], y=scen["scenario_favorable"],
+            mode="lines",
+            name="Scenario Favorable",
+            showlegend=True,
+        ))
+        fig.add_trace(go.Scatter(
+            x=scen["date"], y=scen["scenario_unfavorable"],
+            mode="lines",
+            name="Scenario Unfavorable",
+            showlegend=True,
+        ))
 
     st.plotly_chart(fig, use_container_width=True)
 
