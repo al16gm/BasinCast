@@ -33,7 +33,161 @@ from basincast.translator.meteo import (
 
 from basincast.translator.i18n import language_selector, tr
 
-APP_VERSION = "v0.10"
+# -----------------------------
+# Monthly forecast helpers (viz)
+# -----------------------------
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import BayesianRidge
+
+EXOG_COLS_VIZ = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
+
+
+def _make_model_for_viz(model_type: str):
+    """
+    Must match the names we export in metrics.csv (e.g., bayes_ridge, gbr, rf).
+    """
+    mt = (model_type or "").strip().lower()
+    if mt == "rf":
+        return RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1)
+    if mt == "gbr":
+        return GradientBoostingRegressor(random_state=42)
+    # default
+    return BayesianRidge()
+
+
+def _build_train_table(history: pd.DataFrame, family: str) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Builds a training table in delta-space for ENDO_ML or EXOG_ML.
+    - Uses lag12 = lag1 when not available (for early history).
+    - Uses delta_y_lag1 = 0 for the very first step.
+    """
+    g = history.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    g = g.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+
+    g["value"] = pd.to_numeric(g["value"], errors="coerce")
+    g = g.dropna(subset=["value"]).reset_index(drop=True)
+
+    g["delta_y"] = g["value"].diff()
+
+    g["value_lag1"] = g["value"].shift(1)
+    g["value_lag12"] = g["value"].shift(12)
+    g["value_lag12"] = g["value_lag12"].fillna(g["value_lag1"])
+
+    g["delta_y_lag1"] = g["delta_y"].shift(1).fillna(0.0)
+
+    m = g["date"].dt.month.astype(int)
+    g["month_sin"] = np.sin(2 * np.pi * m / 12.0)
+    g["month_cos"] = np.cos(2 * np.pi * m / 12.0)
+
+    feat_cols = ["value_lag1", "value_lag12", "delta_y_lag1", "month_sin", "month_cos"]
+
+    if family == "EXOG_ML":
+        # Require exog columns; if missing, we fall back to ENDO
+        missing = [c for c in EXOG_COLS_VIZ if c not in g.columns]
+        if missing:
+            raise ValueError(f"Missing EXOG columns for EXOG_ML: {missing}")
+
+        for c in EXOG_COLS_VIZ:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+            g[f"{c}_lag1"] = g[c].shift(1).fillna(g[c])
+            feat_cols.append(f"{c}_lag1")
+
+    out = g.dropna(subset=["delta_y"] + feat_cols).reset_index(drop=True)
+    return out[["date", "delta_y"] + feat_cols], feat_cols
+
+
+def _forecast_monthly_path(
+    history: pd.DataFrame,
+    model_type: str,
+    family: str,
+    max_h: int = 48,
+    non_negative: bool = True,
+) -> pd.DataFrame:
+    """
+    Produces monthly forecasts for h=1..max_h.
+    Output: date, horizon, y_forecast
+    """
+    hist = history.copy()
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    hist = hist.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+
+    last_date = hist["date"].max()
+    last_value = float(pd.to_numeric(hist.iloc[-1]["value"], errors="coerce"))
+
+    # Train model in delta-space
+    train_tbl, feat_cols = _build_train_table(hist, family=family)
+
+    model = _make_model_for_viz(model_type)
+    X_train = train_tbl[feat_cols]
+    y_train = train_tbl["delta_y"]
+    model.fit(X_train, y_train)
+
+    # Build exog lookup + climatology if EXOG
+    exog_df = None
+    clim = None
+    if family == "EXOG_ML":
+        exog_df = hist[["date"] + EXOG_COLS_VIZ].copy()
+        exog_df["date"] = pd.to_datetime(exog_df["date"]).dt.to_period("M").dt.to_timestamp()
+        clim = exog_df.groupby(exog_df["date"].dt.month)[EXOG_COLS_VIZ].mean(numeric_only=True)
+
+    # Recursive monthly forecast
+    y_prev = last_value
+    # lag12 buffer: last 12 observed levels (pad with earliest if needed)
+    vals = hist["value"].astype(float).to_list()
+    if len(vals) >= 12:
+        lag12 = vals[-12:]
+    else:
+        lag12 = [vals[0]] * (12 - len(vals)) + vals
+
+    delta_prev = 0.0
+    out_rows = []
+
+    for h in range(1, int(max_h) + 1):
+        fc_date = (pd.Timestamp(last_date) + pd.DateOffset(months=h)).to_period("M").to_timestamp()
+        m = int(fc_date.month)
+
+        row = {
+            "value_lag1": float(y_prev),
+            "value_lag12": float(lag12[0]),
+            "delta_y_lag1": float(delta_prev),
+            "month_sin": float(np.sin(2 * np.pi * m / 12.0)),
+            "month_cos": float(np.cos(2 * np.pi * m / 12.0)),
+        }
+
+        if family == "EXOG_ML":
+            # exog_lag1 for fc_date = exog of previous month (observed if exists, else climatology)
+            exog_lag_date = (fc_date - pd.DateOffset(months=1)).to_period("M").to_timestamp()
+            rr = exog_df.loc[exog_df["date"] == exog_lag_date] if exog_df is not None else pd.DataFrame()
+
+            if rr is not None and len(rr) > 0:
+                vals_ex = rr.iloc[0][EXOG_COLS_VIZ].to_dict()
+            else:
+                # climatology fallback
+                vals_ex = clim.loc[int(exog_lag_date.month)].to_dict() if clim is not None else {c: 0.0 for c in EXOG_COLS_VIZ}
+
+            for c in EXOG_COLS_VIZ:
+                row[f"{c}_lag1"] = float(vals_ex.get(c, 0.0))
+
+        X = pd.DataFrame([row], columns=feat_cols)
+        delta_pred = float(model.predict(X)[0])
+        y_fc = y_prev + delta_pred
+        if non_negative:
+            y_fc = max(0.0, float(y_fc))
+
+        out_rows.append({"date": fc_date, "horizon": h, "y_forecast": float(y_fc)})
+
+        # update buffers
+        lag12.append(y_fc)
+        lag12 = lag12[-12:]
+        delta_prev = delta_pred
+        y_prev = y_fc
+
+    return pd.DataFrame(out_rows)
+
+
+
+APP_VERSION = "v0.11"
 
 st.set_page_config(page_title=f"BasinCast Translator ({APP_VERSION})", layout="wide")
 
@@ -927,3 +1081,470 @@ if "meteo_df" in st.session_state:
         file_name="meteo_power_monthly.csv",
         mime="text/csv",
     )
+
+
+
+# -----------------------------
+# 10) Run BasinCast + Visualize (v0.11)
+# -----------------------------
+import sys
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import BayesianRidge
+
+
+st.markdown("---")
+st.header("📈 Run BasinCast + Visualize (v0.11)")
+
+if "canonical_df" not in st.session_state:
+    st.error("No canonical_df found in session. Go back and generate the canonical first.")
+    st.stop()
+
+# Prefer canonical_with_meteo if present (EXOG possible)
+run_mode = "ENDO_ONLY"
+if "canonical_with_meteo" in st.session_state and st.session_state["canonical_with_meteo"] is not None:
+    df_run = st.session_state["canonical_with_meteo"].copy()
+    run_mode = "CANONICAL_WITH_METEO"
+else:
+    df_run = st.session_state["canonical_df"].copy()
+
+df_run["date"] = pd.to_datetime(df_run["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+df_run = df_run.dropna(subset=["date", "point_id", "value"]).sort_values(["point_id", "date"]).reset_index(drop=True)
+
+st.caption(f"Run mode: **{run_mode}** | Points: **{df_run['point_id'].nunique()}** | Rows: **{len(df_run)}**")
+
+EXOG_COLS = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
+
+def _pick_latest_csv(folder: Path, prefix: str) -> Path | None:
+    files = list(folder.glob(f"{prefix}*.csv"))
+    if not files:
+        return None
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0]
+
+def _run_core_cli(df_input: pd.DataFrame, outdir: Path, holdout_months: int, inner_val_months: int) -> dict:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    tmp_inp = outdir / "_tmp_canonical_for_core.csv"
+    df_input.to_csv(tmp_inp, index=False)
+
+    script_candidates = [Path("app/run_core_v0_6.py"), Path("app/run_core.py")]
+    core_script = next((p for p in script_candidates if p.exists()), None)
+    if core_script is None:
+        raise FileNotFoundError("Cannot find app/run_core_v0_6.py or app/run_core.py")
+
+    cmd = [
+        sys.executable, str(core_script),
+        "--input", str(tmp_inp),
+        "--outdir", str(outdir),
+        "--holdout_months", str(int(holdout_months)),
+        "--inner_val_months", str(int(inner_val_months)),
+    ]
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    stdout = res.stdout or ""
+    stderr = res.stderr or ""
+
+    if res.returncode != 0:
+        raise RuntimeError(f"Core failed (returncode={res.returncode}). STDOUT:\n{stdout}\nSTDERR:\n{stderr}")
+
+    metrics_path = _pick_latest_csv(outdir, "metrics_")
+    skill_path = _pick_latest_csv(outdir, "skill_")
+    forecasts_path = _pick_latest_csv(outdir, "forecasts_")
+
+    if metrics_path is None or skill_path is None or forecasts_path is None:
+        raise RuntimeError(
+            f"Core did not create expected outputs in {outdir}. "
+            f"Found: metrics={metrics_path}, skill={skill_path}, forecasts={forecasts_path}\n"
+            f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+
+    metrics_df = pd.read_csv(metrics_path)
+    skill_df = pd.read_csv(skill_path)
+    forecasts_df = pd.read_csv(forecasts_path)
+
+    return {
+        "stdout": stdout,
+        "stderr": stderr,
+        "metrics": metrics_df,
+        "skill": skill_df,
+        "forecasts": forecasts_df,
+        "paths": {
+            "metrics": str(metrics_path),
+            "skill": str(skill_path),
+            "forecasts": str(forecasts_path),
+        },
+    }
+
+def _month_start(x) -> pd.Timestamp:
+    return pd.to_datetime(x, errors="coerce").to_period("M").to_timestamp()
+
+def _seasonal_recursive_monthly(history: pd.DataFrame, start_date: pd.Timestamp, max_h: int) -> pd.DataFrame:
+    hist = history.copy()
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    hist = hist.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+
+    start_date = _month_start(start_date)
+    up_to = hist.loc[hist["date"] <= start_date, "value"].astype(float).to_numpy()
+    if len(up_to) == 0:
+        return pd.DataFrame(columns=["date", "horizon", "y_forecast"])
+
+    if len(up_to) >= 12:
+        buf = list(up_to[-12:])
+    else:
+        buf = [float(up_to[0])] * (12 - len(up_to)) + list(up_to)
+
+    rows = []
+    for h in range(1, max_h + 1):
+        y_fc = float(buf[0])
+        dte = (start_date + pd.DateOffset(months=h)).to_period("M").to_timestamp()
+        rows.append({"date": dte, "horizon": int(h), "y_forecast": y_fc})
+        buf = buf[1:] + [y_fc]
+    return pd.DataFrame(rows)
+
+def _model_from_type(model_type: str):
+    mt = (model_type or "").strip().lower()
+    if mt in ("rf", "randomforest", "random_forest"):
+        return RandomForestRegressor(n_estimators=500, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    if mt in ("gbr", "gradientboosting", "gradient_boosting"):
+        return GradientBoostingRegressor(n_estimators=350, learning_rate=0.05, max_depth=4, random_state=42)
+    return BayesianRidge()  # default / "bayes_ridge"
+
+def _make_feats_full(df_point: pd.DataFrame, family: str) -> pd.DataFrame:
+    g = df_point.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    g = g.sort_values("date").reset_index(drop=True)
+
+    g["delta_y"] = g["value"].astype(float).diff()
+    g["value_lag1"] = g["value"].astype(float).shift(1)
+    g["value_lag12"] = g["value"].astype(float).shift(12)
+    g["delta_lag1"] = g["delta_y"].shift(1)
+
+    m = pd.to_datetime(g["date"]).dt.month.to_numpy()
+    g["month_sin"] = np.sin(2 * np.pi * m / 12.0)
+    g["month_cos"] = np.cos(2 * np.pi * m / 12.0)
+
+    feat_cols = ["value_lag1", "value_lag12", "delta_lag1", "month_sin", "month_cos"]
+
+    if family == "EXOG_ML":
+        for c in EXOG_COLS:
+            if c not in g.columns:
+                raise ValueError(f"Missing EXOG column '{c}'")
+            g[f"{c}_lag1"] = pd.to_numeric(g[c], errors="coerce").shift(1)
+            feat_cols.append(f"{c}_lag1")
+
+    out = g[["date", "delta_y"] + feat_cols].dropna().reset_index(drop=True)
+    return out
+
+def _forecast_monthly_ml(df_point: pd.DataFrame, family: str, model_type: str, max_h: int) -> pd.DataFrame:
+    g = df_point.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    g = g.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+    g["value"] = pd.to_numeric(g["value"], errors="coerce")
+    g = g.dropna(subset=["value"])
+
+    if len(g) < 24:
+        raise RuntimeError("Too short for ML monthly forecast")
+
+    last_date = g["date"].max()
+    start_date = _month_start(last_date)
+
+    feats = _make_feats_full(g, family=family)
+    X = feats.drop(columns=["date", "delta_y"]).to_numpy()
+    y = feats["delta_y"].to_numpy()
+
+    model = _model_from_type(model_type)
+    model.fit(X, y)
+
+    exog_df = None
+    clim = None
+    if family == "EXOG_ML":
+        exog_df = g[["date"] + EXOG_COLS].copy()
+        exog_df["date"] = pd.to_datetime(exog_df["date"]).dt.to_period("M").dt.to_timestamp()
+        for c in EXOG_COLS:
+            exog_df[c] = pd.to_numeric(exog_df[c], errors="coerce")
+        clim = exog_df.groupby(exog_df["date"].dt.month)[EXOG_COLS].mean(numeric_only=True)
+
+    y_buf = g["value"].astype(float).to_list()
+    last_delta = (y_buf[-1] - y_buf[-2]) if len(y_buf) >= 2 else 0.0
+
+    rows = []
+    cur = start_date
+    for h in range(1, max_h + 1):
+        nxt = (cur + pd.DateOffset(months=1)).to_period("M").to_timestamp()
+
+        y_lag1 = float(y_buf[-1])
+        y_lag12 = float(y_buf[-12]) if len(y_buf) >= 12 else float(y_lag1)
+        delta_lag1 = float(last_delta)
+
+        mm = int(nxt.month)
+        feats_row = {
+            "value_lag1": y_lag1,
+            "value_lag12": y_lag12,
+            "delta_lag1": delta_lag1,
+            "month_sin": float(np.sin(2 * np.pi * mm / 12.0)),
+            "month_cos": float(np.cos(2 * np.pi * mm / 12.0)),
+        }
+
+        if family == "EXOG_ML":
+            lag_date = (nxt - pd.DateOffset(months=1)).to_period("M").to_timestamp()
+            row = exog_df.loc[exog_df["date"] == lag_date] if exog_df is not None else pd.DataFrame()
+            if row is not None and len(row) > 0:
+                vals = row.iloc[0][EXOG_COLS].to_dict()
+            else:
+                vals = (clim.loc[mm].to_dict() if clim is not None and mm in clim.index else {c: np.nan for c in EXOG_COLS})
+            for c in EXOG_COLS:
+                feats_row[f"{c}_lag1"] = float(vals.get(c, np.nan)) if vals.get(c, np.nan) is not None else np.nan
+
+        Xn = pd.DataFrame([feats_row]).to_numpy()
+        delta_pred = float(model.predict(Xn)[0])
+        y_next = max(0.0, y_lag1 + delta_pred)
+
+        rows.append({"date": nxt, "horizon": int(h), "y_forecast": float(y_next), "delta_y_pred": float(delta_pred)})
+
+        last_delta = delta_pred
+        y_buf.append(y_next)
+        cur = nxt
+
+    return pd.DataFrame(rows)
+
+# UI controls
+c1, c2, c3 = st.columns(3)
+with c1:
+    holdout_months = st.number_input("Holdout months (paper-2 protocol)", min_value=24, max_value=240, value=96, step=12)
+with c2:
+    inner_val_months = st.number_input("Inner validation months", min_value=12, max_value=120, value=36, step=12)
+with c3:
+    run_outdir = Path(st.text_input("Run output folder", value="outputs"))
+
+run_btn = st.button("▶ Run BasinCast Core", type="primary")
+
+if run_btn:
+    try:
+        with st.spinner("Running BasinCast Core..."):
+            out = _run_core_cli(df_run, run_outdir, holdout_months, inner_val_months)
+
+        st.session_state["core_stdout"] = out["stdout"]
+        st.session_state["core_stderr"] = out["stderr"]
+        st.session_state["core_metrics"] = out["metrics"]
+        st.session_state["core_skill"] = out["skill"]
+        st.session_state["core_forecasts"] = out["forecasts"]
+        st.session_state["core_paths"] = out["paths"]
+
+        st.success("✅ Core run completed. Outputs loaded into the app.")
+    except Exception as e:
+        st.error(f"Core run failed: {e}")
+
+# Show logs
+if "core_stdout" in st.session_state:
+    with st.expander("Core logs (stdout/stderr)"):
+        st.code((st.session_state.get("core_stdout", "") or "")[:8000])
+        if st.session_state.get("core_stderr", ""):
+            st.code((st.session_state.get("core_stderr", "") or "")[:8000])
+
+# Visualize if results exist
+if "core_metrics" in st.session_state and "core_skill" in st.session_state and "core_forecasts" in st.session_state:
+    metrics_df = st.session_state["core_metrics"].copy()
+    skill_df = st.session_state["core_skill"].copy()
+    forecasts_df = st.session_state["core_forecasts"].copy()
+
+    if "point_id" not in metrics_df.columns:
+        st.error("metrics output has no point_id column. Cannot visualize.")
+        st.stop()
+
+    point_ids = sorted(metrics_df["point_id"].astype(str).unique().tolist())
+    pid = st.selectbox("Select point_id", point_ids, index=0)
+
+    g_obs = df_run[df_run["point_id"].astype(str) == str(pid)].copy().sort_values("date")
+    g_fc = forecasts_df[forecasts_df["point_id"].astype(str) == str(pid)].copy()
+    g_sk = skill_df[skill_df["point_id"].astype(str) == str(pid)].copy()
+    mrow = metrics_df[metrics_df["point_id"].astype(str) == str(pid)].head(1).copy()
+
+    st.subheader("🧾 Decision summary")
+    selected_family = ""
+    model_type_out = ""
+    planning_h = 0
+    advisory_h = 0
+    cutoff = None
+    meteo_source = ""
+    loc_conf = ""
+
+    if not mrow.empty:
+        m = mrow.iloc[0].to_dict()
+        selected_family = str(m.get("selected_family", ""))
+        model_type_out = str(m.get("model_type", "")) if "model_type" in mrow.columns else ""
+        planning_h = int(m.get("planning_horizon", 0) or 0)
+        advisory_h = int(m.get("advisory_horizon", 0) or 0)
+        meteo_source = str(m.get("meteo_source", ""))
+        loc_conf = str(m.get("location_confidence", ""))
+
+        try:
+            cutoff = pd.to_datetime(m.get("cutoff_date", None), errors="coerce")
+        except Exception:
+            cutoff = None
+
+        colA, colB, colC, colD = st.columns(4)
+        colA.metric("Decision", str(m.get("decision", "")))
+        colB.metric("Selected family", selected_family)
+        colC.metric("Planning horizon", planning_h)
+        colD.metric("Advisory horizon", advisory_h)
+
+        if not model_type_out:
+            # fallback from forecasts table if needed
+            if "model_type" in g_fc.columns and len(g_fc) > 0:
+                try:
+                    model_type_out = str(g_fc["model_type"].dropna().astype(str).iloc[0])
+                except Exception:
+                    model_type_out = ""
+
+        st.caption(
+            f"Model type: {model_type_out or 'baseline/NA'} | Meteo source: {meteo_source or 'NA'} | "
+            f"Location confidence: {loc_conf or 'NA'}"
+        )
+
+    # --- Monthly forecast path 1..48 (or max of horizons) ---
+    max_h = 48
+    if "horizon" in g_fc.columns and len(g_fc) > 0:
+        try:
+            max_h = max(max_h, int(pd.to_numeric(g_fc["horizon"], errors="coerce").max()))
+        except Exception:
+            pass
+    max_h = int(max_h)
+
+    last_date = g_obs["date"].max() if len(g_obs) else None
+    if last_date is None or pd.isna(last_date):
+        st.error("No observed dates found for this point.")
+        st.stop()
+
+    last_date = _month_start(last_date)
+
+    def _class(h: int) -> str:
+        if planning_h and h <= planning_h:
+            return "PLANNING"
+        if advisory_h and h <= advisory_h:
+            return "ADVISORY"
+        return "LOW_CONF"
+
+    # Build monthly path
+    monthly_path = None
+    try:
+        if selected_family == "BASELINE_SEASONAL" or selected_family == "":
+            monthly_path = _seasonal_recursive_monthly(g_obs[["date", "value"]], last_date, max_h=max_h)
+        elif selected_family in ("ENDO_ML", "EXOG_ML"):
+            monthly_path = _forecast_monthly_ml(g_obs, family=selected_family, model_type=model_type_out, max_h=max_h)
+        else:
+            monthly_path = _seasonal_recursive_monthly(g_obs[["date", "value"]], last_date, max_h=max_h)
+    except Exception:
+        # safe fallback
+        monthly_path = _seasonal_recursive_monthly(g_obs[["date", "value"]], last_date, max_h=max_h)
+
+    monthly_path["confidence_class"] = monthly_path["horizon"].astype(int).map(_class)
+
+    st.subheader("📉 Time series + forecasts (monthly path + key horizons)")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=g_obs["date"], y=g_obs["value"],
+        mode="lines", name="Observed"
+    ))
+
+    # Monthly path split by confidence class
+    for klass in ["PLANNING", "ADVISORY", "LOW_CONF"]:
+        gg = monthly_path[monthly_path["confidence_class"] == klass]
+        if gg.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=gg["date"], y=gg["y_forecast"],
+            mode="lines+markers" if klass != "LOW_CONF" else "markers",
+            name=f"Forecast (monthly, {klass}) | {selected_family or 'BASELINE_SEASONAL'} | {model_type_out or 'baseline'}",
+        ))
+
+    # Key horizon points from core output (12/24/36/48)
+    if not g_fc.empty and {"date", "y_forecast"}.issubset(set(g_fc.columns)):
+        g_fc2 = g_fc.copy()
+        g_fc2["date"] = pd.to_datetime(g_fc2["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        g_fc2 = g_fc2.dropna(subset=["date"]).sort_values("date")
+        fig.add_trace(go.Scatter(
+            x=g_fc2["date"], y=g_fc2["y_forecast"],
+            mode="markers",
+            name="Core forecast points (key horizons)",
+        ))
+
+    # Cutoff line (Plotly-safe: use shape + string x)
+    if cutoff is not None and pd.notna(cutoff):
+        cx = _month_start(cutoff).strftime("%Y-%m-%d")
+        fig.add_shape(
+            type="line",
+            x0=cx, x1=cx,
+            y0=0, y1=1,
+            yref="paper",
+            line=dict(dash="dot"),
+        )
+        fig.add_annotation(
+            x=cx, y=1, yref="paper",
+            text="cutoff (backtest)",
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+        )
+
+    fig.update_layout(
+        height=440,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_title="Date",
+        yaxis_title="Value",
+        legend_title="Series",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Skill curves
+    st.subheader("📊 Skill (KGE) vs horizon")
+    if not g_sk.empty and {"horizon", "kge", "family"}.issubset(set(g_sk.columns)):
+        g_sk2 = g_sk.copy()
+        g_sk2["horizon"] = pd.to_numeric(g_sk2["horizon"], errors="coerce")
+        g_sk2["kge"] = pd.to_numeric(g_sk2["kge"], errors="coerce")
+        g_sk2 = g_sk2.dropna(subset=["horizon"]).sort_values(["family", "horizon"])
+
+        fig2 = go.Figure()
+        for fam in sorted(g_sk2["family"].astype(str).unique()):
+            gg = g_sk2[g_sk2["family"].astype(str) == fam]
+            fig2.add_trace(go.Scatter(x=gg["horizon"], y=gg["kge"], mode="lines+markers", name=str(fam)))
+
+        if not mrow.empty:
+            pk = mrow["planning_kge_threshold"].iloc[0] if "planning_kge_threshold" in mrow.columns else None
+            ak = mrow["advisory_kge_threshold"].iloc[0] if "advisory_kge_threshold" in mrow.columns else None
+            if pd.notna(pk):
+                fig2.add_hline(y=float(pk), line_dash="dash", annotation_text="planning threshold", annotation_position="top left")
+            if pd.notna(ak):
+                fig2.add_hline(y=float(ak), line_dash="dot", annotation_text="advisory threshold", annotation_position="bottom left")
+
+        fig2.update_layout(
+            height=360,
+            margin=dict(l=10, r=10, t=40, b=10),
+            xaxis_title="Horizon (months)",
+            yaxis_title="KGE",
+            legend_title="Family",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("Skill table does not contain horizon/kge/family columns in expected format.")
+
+    # Downloads
+    st.subheader("📥 Downloads (Core outputs)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("Download metrics.csv", data=metrics_df.to_csv(index=False).encode("utf-8"), file_name="metrics.csv", mime="text/csv")
+    with c2:
+        st.download_button("Download skill.csv", data=skill_df.to_csv(index=False).encode("utf-8"), file_name="skill.csv", mime="text/csv")
+    with c3:
+        st.download_button("Download forecasts.csv", data=forecasts_df.to_csv(index=False).encode("utf-8"), file_name="forecasts.csv", mime="text/csv")
+
+    if "core_paths" in st.session_state:
+        st.caption(f"Files read from: {st.session_state['core_paths']}")
