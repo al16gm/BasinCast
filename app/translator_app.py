@@ -1446,7 +1446,7 @@ def _paper_leaderboard_from_skill(g_sk: pd.DataFrame, horizons_focus=(1, 12)) ->
         group_cols.append("family")
 
     if "model_type" in df.columns:
-        df["model_type"] = df["model_type"].astype(str)
+        df["model_type"] = df["model_type"].fillna("UNKNOWN").astype(str)
         group_cols.append("model_type")
     else:
         df["model_type"] = "UNKNOWN"
@@ -1642,6 +1642,182 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     # v0.13 Paper-friendly tables + scenarios (NEW)
     # -------------------------
     st.subheader(tr("📋 Tablas paper-friendly (por qué gana un modelo)", "📋 Paper-friendly tables (why a model wins)"))
+
+    # -------------------------
+    # v0.13.2 Model Zoo backtesting (on demand, Streamlit-safe)
+    # -------------------------
+    st.subheader(tr("🏁 Model Zoo (comparativa real por KGE)", "🏁 Model Zoo (real KGE comparison)"))
+
+    with st.expander(tr("Ejecutar comparativa de modelos (solo cuando pulses)", "Run model comparison (only when you click)"), expanded=False):
+        run_zoo = st.button(tr("▶️ Ejecutar Model Zoo", "▶️ Run Model Zoo"), key="run_model_zoo")
+
+        # Select horizons for comparison (paper-friendly defaults)
+        zoo_horizons = st.multiselect(
+            tr("Horizontes para evaluar (meses)", "Evaluation horizons (months)"),
+            options=[1,2,3,6,9,12,18,24,36,48],
+            default=[1,2,3,6,12,18,24],
+            key="zoo_horizons"
+        )
+
+        focus_range = st.selectbox(
+            tr("Rango para decidir ganador (media KGE)", "Range to pick winner (mean KGE)"),
+            options=[(1,12), (1,24), (1,36)],
+            index=0,
+            key="zoo_focus"
+        )
+
+        if run_zoo:
+            # --- Build a clean monthly observed series for this point ---
+            # Expected columns in g_obs: ["date","value"] (or similar)
+            obs_df = g_obs.copy()
+            # Normalize column names defensively
+            if "value" not in obs_df.columns and "y" in obs_df.columns:
+                obs_df = obs_df.rename(columns={"y": "value"})
+            obs_df = obs_df[["date", "value"]].copy()
+            obs_df["date"] = pd.to_datetime(obs_df["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            obs_df = obs_df.dropna(subset=["date", "value"]).sort_values("date").reset_index(drop=True)
+
+            # --- Run lightweight zoo backtest (no core changes) ---
+            # We implement it here to keep v0.13 safe.
+            from sklearn.linear_model import BayesianRidge
+            from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+            def _kge(sim: np.ndarray, obs: np.ndarray) -> float:
+                sim = np.asarray(sim, dtype=float)
+                obs = np.asarray(obs, dtype=float)
+                m = np.isfinite(sim) & np.isfinite(obs)
+                sim, obs = sim[m], obs[m]
+                if len(sim) < 3:
+                    return np.nan
+                mean_sim, mean_obs = np.mean(sim), np.mean(obs)
+                std_sim, std_obs = np.std(sim, ddof=0), np.std(obs, ddof=0)
+                if mean_obs == 0 or std_obs == 0:
+                    return np.nan
+                r = np.corrcoef(sim, obs)[0, 1] if len(sim) > 1 else np.nan
+                alpha = std_sim / std_obs if std_obs != 0 else np.nan
+                beta = mean_sim / mean_obs if mean_obs != 0 else np.nan
+                if not np.isfinite(r) or not np.isfinite(alpha) or not np.isfinite(beta):
+                    return np.nan
+                return 1.0 - np.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
+
+            def _seasonal_naive_predict(hist: pd.DataFrame, origin: pd.Timestamp, h: int) -> float:
+                obs_map = dict(zip(hist["date"].tolist(), hist["value"].astype(float).tolist()))
+                target = (origin + pd.DateOffset(months=int(h))).to_period("M").to_timestamp()
+                ref = (target - pd.DateOffset(months=12)).to_period("M").to_timestamp()
+                if ref in obs_map and np.isfinite(obs_map[ref]):
+                    return float(obs_map[ref])
+                # fallback: last available at origin
+                return float(obs_map.get(origin, hist["value"].iloc[-1]))
+
+            def _make_features(df: pd.DataFrame, lags=(1,2,3,6,12)) -> pd.DataFrame:
+                d = df.copy()
+                for L in lags:
+                    d[f"y_lag_{L}"] = d["value"].shift(L)
+                m = d["date"].dt.month
+                d["month_sin"] = np.sin(2*np.pi*m/12.0)
+                d["month_cos"] = np.cos(2*np.pi*m/12.0)
+                return d
+
+            lags = (1,2,3,6,12)
+            feat = _make_features(obs_df, lags=lags).dropna().reset_index(drop=True)
+            feat_cols = [f"y_lag_{L}" for L in lags] + ["month_sin","month_cos"]
+
+            # Rolling origins: last 24 months where training is possible
+            min_train = 36
+            dates = obs_df["date"].drop_duplicates().sort_values().reset_index(drop=True)
+            origins = []
+            for i in range(len(dates)-1, -1, -1):
+                origin = dates.iloc[i]
+                n_train = int((dates <= origin).sum())
+                if n_train >= min_train:
+                    origins.append(origin)
+                if len(origins) >= 24:
+                    break
+            origins = sorted(origins)
+
+            if len(origins) < 5:
+                st.warning(tr("No hay suficientes orígenes para backtesting (necesitas más histórico).",
+                            "Not enough rolling origins for backtesting (need more history)."))
+            else:
+                models = {
+                    "BayesianRidge": BayesianRidge(),
+                    "RandomForest": RandomForestRegressor(n_estimators=300, random_state=42),
+                    "GradientBoosting": GradientBoostingRegressor(random_state=42),
+                }
+
+                # Collect predictions per model per horizon across origins
+                rows = []
+                for model_name in ["seasonal_naive"] + list(models.keys()):
+                    for h in zoo_horizons:
+                        sims, obs = [], []
+                        for origin in origins:
+                            target = (origin + pd.DateOffset(months=int(h))).to_period("M").to_timestamp()
+                            obs_row = obs_df.loc[obs_df["date"] == target, "value"]
+                            if len(obs_row) == 0:
+                                continue
+                            y_true = float(obs_row.iloc[0])
+
+                            try:
+                                if model_name == "seasonal_naive":
+                                    y_pred = _seasonal_naive_predict(obs_df, origin, int(h))
+                                else:
+                                    # train up to origin
+                                    train = feat.loc[feat["date"] <= origin].copy()
+                                    if len(train) < min_train:
+                                        continue
+                                    X = train[feat_cols].values
+                                    y = train["value"].values
+                                    m = models[model_name]
+                                    m.fit(X, y)
+
+                                    # 1-step direct at horizon h (simple and robust):
+                                    # use features at target if available (requires lags observed)
+                                    # if target features not available, skip
+                                    target_row = feat.loc[feat["date"] == target]
+                                    if len(target_row) == 0:
+                                        continue
+                                    y_pred = float(m.predict(target_row[feat_cols].values)[0])
+
+                                sims.append(y_pred)
+                                obs.append(y_true)
+                            except Exception:
+                                continue
+
+                        score = _kge(np.array(sims), np.array(obs))
+                        rows.append({
+                            "model_type": model_name,
+                            "family": "ENDO_ZOO",
+                            "horizon": int(h),
+                            "kge": score,
+                            "n_pairs": int(np.isfinite(score)) and len(obs) or 0
+                        })
+
+                zoo_skill = pd.DataFrame(rows)
+                zoo_skill = zoo_skill.dropna(subset=["kge"]).copy()
+
+                if zoo_skill.empty:
+                    st.warning(tr("No se han podido calcular KGE para el zoo (revisa histórico y lags).",
+                                "Could not compute KGE for zoo (check history and lags)."))
+                else:
+                    st.write(tr("Skill por horizonte (KGE):", "Skill by horizon (KGE):"))
+                    st.dataframe(zoo_skill.sort_values(["model_type", "horizon"]), use_container_width=True)
+
+                    # Leaderboard = mean KGE over focus range
+                    hmin, hmax = focus_range
+                    focus = zoo_skill[(zoo_skill["horizon"] >= hmin) & (zoo_skill["horizon"] <= hmax)]
+                    zoo_leader = (
+                        focus.groupby(["model_type"], as_index=False)
+                            .agg(kge_mean=("kge","mean"), kge_std=("kge","std"), kge_min=("kge","min"), kge_max=("kge","max"))
+                            .sort_values(["kge_mean","kge_min"], ascending=[False, False])
+                            .reset_index(drop=True)
+                    )
+                    zoo_leader["rank"] = np.arange(1, len(zoo_leader)+1)
+
+                    st.write(tr("Leaderboard (ganador por KGE medio):", "Leaderboard (winner by mean KGE):"))
+                    st.dataframe(zoo_leader, use_container_width=True)
+
+                    winner = zoo_leader.iloc[0]["model_type"]
+                    st.success(tr(f"Ganador automático: {winner}", f"Automatic winner: {winner}"))
 
     # 1) Leaderboard from core skill (best-effort: family + model_type if available)
     leaderboard = _paper_leaderboard_from_skill(g_sk, horizons_focus=(1, 12))
