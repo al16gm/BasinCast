@@ -76,6 +76,64 @@ def _month_range(start: pd.Timestamp, end: pd.Timestamp) -> List[pd.Timestamp]:
 def _sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+def _snap_to_half_degree(x: float) -> float:
+    return round(float(x) * 2.0) / 2.0
+
+
+def _normalize_bbox_for_0p5deg_grid(
+    bbox: Tuple[float, float, float, float],
+    min_halfwidth: float = 0.26,
+) -> Tuple[Tuple[float, float, float, float], Dict[str, str]]:
+    """
+    If bbox is very narrow (point-like), snap its center to the 0.5° grid and
+    expand to a minimal window so at least one grid cell is included.
+    Returns (bbox_effective, meta).
+    """
+    lat0, lon0, lat1, lon1 = bbox
+    lat_min, lat_max = sorted([float(lat0), float(lat1)])
+    lon_min, lon_max = sorted([float(lon0), float(lon1)])
+
+    width_lat = lat_max - lat_min
+    width_lon = lon_max - lon_min
+
+    c_lat = 0.5 * (lat_min + lat_max)
+    c_lon = 0.5 * (lon_min + lon_max)
+
+    meta: Dict[str, str] = {
+        "bbox_input": f"({lat_min},{lon_min},{lat_max},{lon_max})",
+        "bbox_snapped": "false",
+    }
+
+    # If bbox is narrower than ~one grid step, we snap+expand
+    if (width_lat < 0.75) and (width_lon < 0.75):
+        s_lat = _snap_to_half_degree(c_lat)
+        s_lon = _snap_to_half_degree(c_lon)
+
+        half_lat = max(min_halfwidth, 0.5 * width_lat)
+        half_lon = max(min_halfwidth, 0.5 * width_lon)
+
+        bbox_eff = (s_lat - half_lat, s_lon - half_lon, s_lat + half_lat, s_lon + half_lon)
+        meta.update(
+            {
+                "bbox_snapped": "true",
+                "bbox_center_input": f"({c_lat},{c_lon})",
+                "bbox_center_snapped": f"({s_lat},{s_lon})",
+                "bbox_effective": f"{bbox_eff}",
+            }
+        )
+        return bbox_eff, meta
+
+    # Otherwise just ensure ordering and non-zero width if needed
+    if width_lat == 0.0:
+        lat_min -= min_halfwidth
+        lat_max += min_halfwidth
+    if width_lon == 0.0:
+        lon_min -= min_halfwidth
+        lon_max += min_halfwidth
+
+    bbox_eff = (lat_min, lon_min, lat_max, lon_max)
+    meta["bbox_effective"] = f"{bbox_eff}"
+    return bbox_eff, meta
 
 def _download_dataverse_file(
     file_id: int,
@@ -315,6 +373,12 @@ def build_total_demand_hm3_monthly(
         "units_in": "km3/month",
         "units_out": "hm3/month",
     }
+
+    # Normalize bbox to match 0.5° grid (prevents all-zero due to point-like bbox)
+    if bbox is not None:
+        bbox_eff, bbox_meta = _normalize_bbox_for_0p5deg_grid(bbox, min_halfwidth=0.26)
+        info.update(bbox_meta)
+        bbox = bbox_eff
 
     # Determine cache key
     bbox_str = "NONE" if bbox is None else f"{bbox[0]:.4f},{bbox[1]:.4f},{bbox[2]:.4f},{bbox[3]:.4f}"
