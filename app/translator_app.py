@@ -17,6 +17,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+
+import hashlib
+from datetime import datetime
+
 from pyproj import CRS, Transformer
 
 import plotly.graph_objects as go
@@ -1354,8 +1358,18 @@ demand_choice = st.radio(
     key="demand_choice_v014",
 )
 
-# Always define session key to avoid None errors downstream
-st.session_state["canonical_with_meteo_and_demand"] = None
+# ---- Persistent state keys (do NOT overwrite every rerun) ----
+if "canonical_with_meteo_and_demand" not in st.session_state:
+    st.session_state["canonical_with_meteo_and_demand"] = None
+if "open_demand_info" not in st.session_state:
+    st.session_state["open_demand_info"] = None
+
+# If the user changed the option, clear previous merge to avoid mixing states
+_prev_choice = st.session_state.get("demand_choice_prev_v014", None)
+if _prev_choice is not None and _prev_choice != demand_choice:
+    st.session_state["canonical_with_meteo_and_demand"] = None
+    st.session_state["open_demand_info"] = None
+st.session_state["demand_choice_prev_v014"] = demand_choice
 
 # -----------------------------
 # Helpers (local fallbacks) — so this block never NameErrors
@@ -1452,11 +1466,22 @@ if demand_choice.startswith("A)"):
                         ddem["point_id"] = ddem[dem_pid_col].astype(str).str.strip()
                         ddem = ddem.groupby(["point_id", "date"], as_index=False)["demand"].mean()
                         merged = base_exog.merge(ddem[["point_id", "date", "demand"]], on=["point_id", "date"], how="left")
+                        apply_mode = "HAS_POINT_ID"
                     else:
                         ddem = ddem.groupby(["date"], as_index=False)["demand"].mean()
                         merged = base_exog.merge(ddem[["date", "demand"]], on=["date"], how="left")
+                        apply_mode = "COMMON_ALL"
 
                     st.session_state["canonical_with_meteo_and_demand"] = merged
+                    st.session_state["open_demand_info"] = {
+                        "source": "user_upload",
+                        "apply_mode": apply_mode,
+                        "file_name": getattr(demand_upload, "name", "UNKNOWN"),
+                        "date_col": str(dem_date_col),
+                        "value_col": str(dem_val_col),
+                        "point_id_col": str(dem_pid_col) if dem_pid_col is not None else None,
+                    }
+
                     st.success(tr(
                         f"Demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
                         f"Demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
@@ -1485,130 +1510,147 @@ elif demand_choice.startswith("B)"):
 
     hist_min = pd.to_datetime(base_exog["date"].min(), errors="coerce")
     hist_max = pd.to_datetime(base_exog["date"].max(), errors="coerce")
-    st.caption(f"Your historical period: {hist_min.date()} to {hist_max.date()}")
-
-    # Dataset starts ~2010 in this product family; we auto-overlap
-    overlap_start = max(hist_min.to_period("M").to_timestamp(), pd.Timestamp("2010-01-01"))
-    overlap_end = hist_max.to_period("M").to_timestamp()
-    st.caption(f"Demand overlap used: {overlap_start.date()} to {overlap_end.date()}")
-
-    # Status of cache
-    st.caption(f"Cache folder: {cache_dir}")
-    st.write(
-        tr("Estado de caché ZIP:", "ZIP cache status:", LANG),
-        {
-            "zip1_exists": zip1.exists(),
-            "zip2_exists": zip2.exists(),
-            "zip1_path": str(zip1),
-            "zip2_path": str(zip2),
-        },
-    )
-
-    if zip1.exists() and zip2.exists():
-        st.success("Cached ZIPs found ✅ (no upload needed).")
+    if pd.isna(hist_min) or pd.isna(hist_max):
+        st.warning("Historical dates are invalid. Continuing safely without demand.")
+        st.session_state["canonical_with_meteo_and_demand"] = None
+        st.session_state["open_demand_info"] = None
     else:
-        st.warning("Missing one or both ZIPs. Upload them once below OR enable auto-download (large files).")
+        st.caption(f"Your historical period: {hist_min.date()} to {hist_max.date()}")
 
-        c_up1, c_up2 = st.columns(2)
-        with c_up1:
-            up1 = st.file_uploader(
-                "Upload ZIP 1 (…monthly_1.zip)",
-                type=["zip"],
-                key="open_demand_zip1_upload_v014",
-            )
-        with c_up2:
-            up2 = st.file_uploader(
-                "Upload ZIP 2 (…monthly_2.zip)",
-                type=["zip"],
-                key="open_demand_zip2_upload_v014",
-            )
+        overlap_start = max(hist_min.to_period("M").to_timestamp(), pd.Timestamp("2010-01-01"))
+        overlap_end = hist_max.to_period("M").to_timestamp()
+        st.caption(f"Demand overlap used: {overlap_start.date()} to {overlap_end.date()}")
 
-        if up1 is not None:
+        st.caption(f"Cache folder: {cache_dir}")
+        st.write(
+            tr("Estado de caché ZIP:", "ZIP cache status:", LANG),
+            {
+                "zip1_exists": zip1.exists(),
+                "zip2_exists": zip2.exists(),
+                "zip1_path": str(zip1),
+                "zip2_path": str(zip2),
+            },
+        )
+
+        if zip1.exists() and zip2.exists():
+            st.success("Cached ZIPs found ✅ (no upload needed).")
+        else:
+            st.warning("Missing one or both ZIPs. Upload them once below OR enable auto-download (large files).")
+
+            c_up1, c_up2 = st.columns(2)
+            with c_up1:
+                up1 = st.file_uploader("Upload ZIP 1 (…monthly_1.zip)", type=["zip"], key="open_demand_zip1_upload_v014")
+            with c_up2:
+                up2 = st.file_uploader("Upload ZIP 2 (…monthly_2.zip)", type=["zip"], key="open_demand_zip2_upload_v014")
+
+            if up1 is not None:
+                try:
+                    with open(zip1, "wb") as f:
+                        f.write(up1.getbuffer())
+                    st.success(f"Saved ZIP1 ✅ {zip1}")
+                except Exception as e:
+                    st.error(f"Failed to save ZIP1 (safe): {e}")
+
+            if up2 is not None:
+                try:
+                    with open(zip2, "wb") as f:
+                        f.write(up2.getbuffer())
+                    st.success(f"Saved ZIP2 ✅ {zip2}")
+                except Exception as e:
+                    st.error(f"Failed to save ZIP2 (safe): {e}")
+
+        allow_download = st.checkbox(
+            "Allow auto-download from Dataverse if ZIPs missing (VERY LARGE, ~2–3GB).",
+            value=False,
+            key="open_demand_allow_download_v014",
+        )
+
+        ssl_verify = st.checkbox(
+            "SSL verify (uncheck only if corporate SSL blocks requests)",
+            value=True,
+            key="open_demand_ssl_verify_v014",
+        )
+
+        if st.button("✅ Integrate OPEN demand into canonical (safe)", key="apply_open_demand_v014"):
             try:
-                with open(zip1, "wb") as f:
-                    f.write(up1.getbuffer())
-                st.success(f"Saved ZIP1 ✅ {zip1}")
+                from basincast.demand.open_demand import build_total_demand_hm3_monthly, integrate_total_demand_into_canonical
+
+                # Guard: if zips missing and we don't allow download, don't attempt
+                if (not zip1.exists() or not zip2.exists()) and (not allow_download):
+                    st.warning("ZIPs missing and auto-download disabled. Upload the ZIPs or enable download.")
+                    st.session_state["canonical_with_meteo_and_demand"] = None
+                    st.session_state["open_demand_info"] = None
+                else:
+                    months_needed = list(pd.date_range(start=overlap_start, end=overlap_end, freq="MS"))
+
+                    bbox = None
+                    if ("lat" in base_exog.columns) and ("lon" in base_exog.columns):
+                        lat = pd.to_numeric(base_exog["lat"], errors="coerce")
+                        lon = pd.to_numeric(base_exog["lon"], errors="coerce")
+                        if lat.notna().any() and lon.notna().any():
+                            bbox = (float(lat.min()), float(lon.min()), float(lat.max()), float(lon.max()))
+                    if bbox is None:
+                        st.warning("No valid lat/lon in canonical table. Skipping open demand safely (bbox is required).")
+                        st.session_state["canonical_with_meteo_and_demand"] = None
+                        st.session_state["open_demand_info"] = None
+                    else:
+                        dem_df, info = build_total_demand_hm3_monthly(
+                            cache_dir=cache_dir,
+                            scenario=scenario,
+                            gcm=gcm,
+                            file_id_1=file_id_1,
+                            file_id_2=file_id_2,
+                            zip_name_1=zip_name_1,
+                            zip_name_2=zip_name_2,
+                            months_needed=months_needed,
+                            bbox=bbox,
+                            allow_download=bool(allow_download),
+                            ssl_verify=bool(ssl_verify),
+                            fail_soft=True,
+                        )
+
+                        # Store provenance for manifest
+                        info = dict(info or {})
+                        info.update({
+                            "source": "dataverse_zip_csv",
+                            "scenario": scenario,
+                            "gcm": gcm,
+                            "file_id_1": int(file_id_1),
+                            "file_id_2": int(file_id_2),
+                            "zip1": str(zip1),
+                            "zip2": str(zip2),
+                        })
+                        st.session_state["open_demand_info"] = info
+
+                        if dem_df is None or dem_df.empty:
+                            st.warning(f"Open demand not integrated (safe). Info: {info}")
+                            st.session_state["canonical_with_meteo_and_demand"] = None
+                        else:
+                            merged = integrate_total_demand_into_canonical(
+                                base_exog,
+                                dem_df,      # expects demand_hm3
+                                date_col="date",
+                                out_col="demand",
+                            )
+                            st.session_state["canonical_with_meteo_and_demand"] = merged
+                            st.success(tr(
+                                f"Open demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
+                                f"Open demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
+                                LANG,
+                            ))
+                            with st.expander("Open demand provenance (paper-friendly)"):
+                                st.json(info)
+
             except Exception as e:
-                st.error(f"Failed to save ZIP1 (safe): {e}")
-
-        if up2 is not None:
-            try:
-                with open(zip2, "wb") as f:
-                    f.write(up2.getbuffer())
-                st.success(f"Saved ZIP2 ✅ {zip2}")
-            except Exception as e:
-                st.error(f"Failed to save ZIP2 (safe): {e}")
-
-    allow_download = st.checkbox(
-        "Allow auto-download from Dataverse if ZIPs missing (VERY LARGE, ~2–3GB).",
-        value=False,
-        key="open_demand_allow_download_v014",
-    )
-
-    if st.button("✅ Integrate OPEN demand into canonical (safe)", key="apply_open_demand_v014"):
-        try:
-            from basincast.demand.open_demand import build_total_demand_hm3_monthly, integrate_total_demand_into_canonical
-
-            # Ensure we only compute overlap period (so 1988–2023 -> 2010–2023)
-            months_needed = list(pd.date_range(start=overlap_start, end=overlap_end, freq="MS"))
-
-            # bbox requires lat/lon; if missing, we run without bbox (will be heavy) -> so we protect
-            bbox = None
-            if ("lat" in base_exog.columns) and ("lon" in base_exog.columns):
-                lat = pd.to_numeric(base_exog["lat"], errors="coerce")
-                lon = pd.to_numeric(base_exog["lon"], errors="coerce")
-                if lat.notna().any() and lon.notna().any():
-                    bbox = (float(lat.min()), float(lon.min()), float(lat.max()), float(lon.max()))
-            else:
-                st.warning("No lat/lon in canonical table. Open demand without bbox would be too heavy; continuing safely without integrating.")
+                st.error(f"Open demand integration failed (safe): {e}")
                 st.session_state["canonical_with_meteo_and_demand"] = None
-                raise RuntimeError("Missing lat/lon for bbox. Skipping open demand to avoid heavy global aggregation.")
-
-            dem_df, info = build_total_demand_hm3_monthly(
-                cache_dir=cache_dir,
-                scenario=scenario,
-                gcm=gcm,
-                file_id_1=file_id_1,
-                file_id_2=file_id_2,
-                zip_name_1=zip_name_1,
-                zip_name_2=zip_name_2,
-                months_needed=months_needed,
-                bbox=bbox,
-                allow_download=bool(allow_download),
-                ssl_verify=True,
-                fail_soft=True,
-            )
-
-            if dem_df.empty:
-                st.warning(f"Open demand not integrated (safe). Info: {info}")
-                st.session_state["canonical_with_meteo_and_demand"] = None
-            else:
-                # Merge into canonical, keep column name consistent with option A: "demand"
-                merged = integrate_total_demand_into_canonical(
-                    base_exog,
-                    dem_df,                 # <-- keep 'demand_hm3' here
-                    date_col="date",
-                    out_col="demand"        # <-- output column will be named 'demand'
-                )
-
-                st.session_state["canonical_with_meteo_and_demand"] = merged
-                st.success(tr(
-                    f"Open demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
-                    f"Open demand integrated ✅  Non-null rows: {int(merged['demand'].notna().sum())}",
-                    LANG,
-                ))
-                with st.expander("Open demand provenance (paper-friendly)"):
-                    st.json(info)
-
-        except Exception as e:
-            # Even if something unexpected happens, DO NOT break the app
-            st.error(f"Open demand integration failed (safe): {e}")
-            st.session_state["canonical_with_meteo_and_demand"] = None
+                st.session_state["open_demand_info"] = None
 
 # C) No demand
 else:
     st.info(tr("Continuamos sin demanda.", "Continuing without demand.", LANG))
     st.session_state["canonical_with_meteo_and_demand"] = None
+    st.session_state["open_demand_info"] = None
 
 cwd = st.session_state.get("canonical_with_meteo_and_demand", None)
 if cwd is not None:
@@ -1620,11 +1662,17 @@ if cwd is not None:
         mime="text/csv",
     )
 
+
 # -----------------------------
 # 10) Run BasinCast + Visualize
 # -----------------------------
 st.markdown("---")
-st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.13)", "📈 Run BasinCast Core + Visualize (v0.13)", LANG))
+st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast Core + Visualize (v0.14)", LANG))
+
+import json
+import hashlib
+from datetime import datetime
+from typing import Optional
 
 # Prefer canonical_with_meteo_and_demand > canonical_with_meteo > canonical_df
 df_run = None
@@ -1657,6 +1705,34 @@ def _pick_latest_csv(folder: Path, prefix: str) -> Optional[Path]:
         return None
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0]
+
+def _make_run_id() -> str:
+    return datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def _try_git_commit_hash() -> str:
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(Path.cwd()),
+        )
+        if res.returncode == 0:
+            return (res.stdout or "").strip()
+    except Exception:
+        pass
+    return "UNKNOWN"
 
 def _resolve_core_outputs(outdir: Path) -> tuple[Path, Path, Path]:
     fixed_metrics = outdir / "metrics_v0_6.csv"
@@ -1736,7 +1812,24 @@ with c2:
         min_value=12, max_value=120, value=36, step=12
     )
 with c3:
-    run_outdir = Path(st.text_input(tr("Carpeta outputs", "Run output folder", LANG), value="outputs"))
+    default_root = Path("outputs") / "runs"
+    default_root.mkdir(parents=True, exist_ok=True)
+
+    run_root = Path(st.text_input(
+        tr("Carpeta raíz de runs", "Runs root folder", LANG),
+        value=str(default_root),
+    ))
+
+    # pending run id (so you see the folder BEFORE running)
+    if "pending_run_id" not in st.session_state:
+        st.session_state["pending_run_id"] = _make_run_id()
+
+    regen = st.button(tr("🔄 Nuevo run folder", "🔄 New run folder", LANG), key="regen_run_id_v014")
+    if regen:
+        st.session_state["pending_run_id"] = _make_run_id()
+
+    run_outdir = run_root / st.session_state["pending_run_id"]
+    st.caption(f"Next run folder: {run_outdir}")
 
 run_btn = st.button(tr("▶ Ejecutar BasinCast Core", "▶ Run BasinCast Core", LANG), type="primary")
 
@@ -1745,12 +1838,55 @@ if run_btn:
         with st.spinner(tr("Ejecutando BasinCast Core...", "Running BasinCast Core...", LANG)):
             out = _run_core_cli(df_run, run_outdir, holdout_months, inner_val_months)
 
+        # ---- Write manifest.json (paper-friendly reproducibility) ----
+        try:
+            tmp_inp = Path(run_outdir) / "_tmp_canonical_for_core.csv"
+            canonical_sha256 = _sha256_file(tmp_inp) if tmp_inp.exists() else "MISSING"
+
+            meteo_info = st.session_state.get("meteo_info", None)
+            demand_info = st.session_state.get("open_demand_info", None)
+
+            manifest = {
+                "run_id": st.session_state.get("pending_run_id", "UNKNOWN"),
+                "timestamp_local": datetime.now().isoformat(timespec="seconds"),
+                "git_commit": _try_git_commit_hash(),
+                "core": {
+                    "holdout_months": int(holdout_months),
+                    "inner_val_months": int(inner_val_months),
+                },
+                "inputs": {
+                    "canonical_csv": str(tmp_inp),
+                    "canonical_sha256": canonical_sha256,
+                    "run_mode": str(run_mode),
+                },
+                "provenance": {
+                    "meteo": meteo_info,
+                    "demand": demand_info,
+                },
+                "outputs": out.get("paths", {}),
+            }
+
+            manifest_path = Path(run_outdir) / "manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+            st.caption(f"Manifest saved: {manifest_path}")
+
+            # Include manifest in displayed paths
+            out["paths"]["manifest"] = str(manifest_path)
+        except Exception as e:
+            st.warning(f"Manifest could not be written (safe): {e}")
+
         st.session_state["core_stdout"] = out["stdout"]
         st.session_state["core_stderr"] = out["stderr"]
         st.session_state["core_metrics"] = out["metrics"]
         st.session_state["core_skill"] = out["skill"]
         st.session_state["core_forecasts"] = out["forecasts"]
         st.session_state["core_paths"] = out["paths"]
+        st.session_state["last_run_outdir"] = str(run_outdir)
+
+        # After a run, auto-generate a fresh run id for the NEXT run (prevents overwriting)
+        st.session_state["pending_run_id"] = _make_run_id()
 
         st.success(tr(
             "Core ejecutado. Outputs cargados en la app.",
@@ -1983,7 +2119,6 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             gg = gk[gk["family"].astype(str) == fam]
             fig2.add_trace(go.Scatter(x=gg["horizon"], y=gg["kge"], mode="lines+markers", name=str(fam)))
 
-        # thresholds (paper-friendly)
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
                        y0=0.60, y1=0.60, xref="x", yref="y", line=dict(width=1, dash="dash"))
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
@@ -2021,3 +2156,5 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
 
     if "core_paths" in st.session_state:
         st.caption(f"Files read from: {st.session_state['core_paths']}")
+    if "last_run_outdir" in st.session_state:
+        st.caption(f"Last run folder: {st.session_state['last_run_outdir']}")
