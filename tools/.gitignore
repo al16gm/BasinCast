@@ -1,0 +1,5 @@
+﻿# tools/ is for diagnostics and small utilities
+*.part
+*.tmp
+*.log
+__pycache__/
