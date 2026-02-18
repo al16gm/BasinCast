@@ -49,7 +49,8 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # -----------------------------
 # Feature engineering
 # -----------------------------
-EXOG_COLS = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
+EXOG_METEO_COLS = ["precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c"]
+DEMAND_COL = "demand"  # canonical column name (both user upload and open-demand write this)
 
 
 def _to_month_start(x) -> pd.Timestamp:
@@ -63,15 +64,15 @@ def _month_sin_cos(dates: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
 
 def make_features(df: pd.DataFrame, family: str) -> pd.DataFrame:
     """
-    Build a modeling table in incremental space (delta_y) with ENDO or EXOG family.
+    Build a modeling table in incremental space (delta_y) with ENDO / EXOG_METEO / DEMAND.
 
-    ENDO features:
-      - value_lag1, value_lag12, delta_lag1, month_sin, month_cos
+    Families:
+      - ENDO_ML: only endogenous lags + month sin/cos
+      - EXOG_ML: ENDO + meteo_lag1
+      - DEMAND_ML: ENDO + demand_lag1
+      - EXOG_ML_DEMAND: ENDO + meteo_lag1 + demand_lag1
 
-    EXOG features:
-      - ENDO + exog_lag1 for precip/temp
-
-    Returns a DataFrame with feature columns + delta_y (target), indexed by date.
+    Returns: DataFrame with ['date', 'delta_y'] + ordered feature columns, dropping NaNs.
     """
     g = df.copy()
     g["date"] = pd.to_datetime(g["date"], errors="coerce")
@@ -89,13 +90,21 @@ def make_features(df: pd.DataFrame, family: str) -> pd.DataFrame:
 
     feat_cols = ["value_lag1", "value_lag12", "delta_lag1", "month_sin", "month_cos"]
 
-    if family == "EXOG_ML":
-        for c in EXOG_COLS:
+    # --- Meteo part ---
+    if family in ("EXOG_ML", "EXOG_ML_DEMAND"):
+        for c in EXOG_METEO_COLS:
             if c not in g.columns:
-                raise ValueError(f"Missing EXOG column '{c}' for family=EXOG_ML")
-        for c in EXOG_COLS:
-            g[f"{c}_lag1"] = g[c].shift(1)
+                raise ValueError(f"Missing EXOG meteo column '{c}' for family={family}")
+        for c in EXOG_METEO_COLS:
+            g[f"{c}_lag1"] = pd.to_numeric(g[c], errors="coerce").shift(1)
             feat_cols.append(f"{c}_lag1")
+
+    # --- Demand part ---
+    if family in ("DEMAND_ML", "EXOG_ML_DEMAND"):
+        if DEMAND_COL not in g.columns:
+            raise ValueError(f"Missing demand column '{DEMAND_COL}' for family={family}")
+        g["demand_lag1"] = pd.to_numeric(g[DEMAND_COL], errors="coerce").shift(1)
+        feat_cols.append("demand_lag1")
 
     out = g[["date", "delta_y"] + feat_cols].dropna().reset_index(drop=True)
     return out
@@ -167,6 +176,11 @@ def recursive_forecast_path_delta(
 ) -> List[Tuple[pd.Timestamp, float]]:
     """
     Returns list of (date, y_forecast) for steps 1..horizon_max using recursive delta_y predictions.
+
+    Exogenous handling:
+      - EXOG_ML: uses meteo (lag1), fallback to monthly climatology if missing for a month
+      - DEMAND_ML: uses demand (lag1), fallback to monthly climatology if missing for a month
+      - EXOG_ML_DEMAND: uses both
     """
     hist = history.copy()
     hist["date"] = pd.to_datetime(hist["date"])
@@ -182,16 +196,42 @@ def recursive_forecast_path_delta(
     last_delta = (y_buffer[-1] - y_buffer[-2]) if len(y_buffer) >= 2 else 0.0
     cur_date = start_date
 
+    # Determine which exog components are required
+    need_meteo = family in ("EXOG_ML", "EXOG_ML_DEMAND")
+    need_demand = family in ("DEMAND_ML", "EXOG_ML_DEMAND")
+
     ed = None
-    clim = None
-    if family == "EXOG_ML":
+    clim_meteo = None
+    clim_demand = None
+
+    if need_meteo or need_demand:
         if exog_df is None:
-            raise ValueError("EXOG_ML requires exog_df.")
+            raise ValueError(f"{family} requires exog_df (meteo and/or demand).")
+
         ed = exog_df.copy()
-        ed["date"] = pd.to_datetime(ed["date"]).dt.to_period("M").dt.to_timestamp()
-        clim = ed.groupby(ed["date"].dt.month)[EXOG_COLS].mean(numeric_only=True)
+        ed["date"] = pd.to_datetime(ed["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+
+        if need_meteo:
+            for c in EXOG_METEO_COLS:
+                if c not in ed.columns:
+                    raise ValueError(f"{family} requires meteo column '{c}' in exog_df.")
+            clim_meteo = ed.groupby(ed["date"].dt.month)[EXOG_METEO_COLS].mean(numeric_only=True)
+
+        if need_demand:
+            if DEMAND_COL not in ed.columns:
+                raise ValueError(f"{family} requires demand column '{DEMAND_COL}' in exog_df.")
+            tmp = pd.to_numeric(ed[DEMAND_COL], errors="coerce")
+            clim_demand = tmp.groupby(ed["date"].dt.month).mean()
 
     preds: List[Tuple[pd.Timestamp, float]] = []
+
+    # Feature column order MUST match training
+    feat_cols = ["value_lag1", "value_lag12", "delta_lag1", "month_sin", "month_cos"]
+    if need_meteo:
+        for c in EXOG_METEO_COLS:
+            feat_cols.append(f"{c}_lag1")
+    if need_demand:
+        feat_cols.append("demand_lag1")
 
     for _ in range(horizon_max):
         next_date = (cur_date + pd.DateOffset(months=1)).to_period("M").to_timestamp()
@@ -209,18 +249,29 @@ def recursive_forecast_path_delta(
             "month_cos": float(np.cos(2 * np.pi * m / 12.0)),
         }
 
-        if family == "EXOG_ML":
-            exog_lag_date = (next_date - pd.DateOffset(months=1)).to_period("M").to_timestamp()
-            row = ed.loc[ed["date"] == exog_lag_date]
-            if len(row) == 0:
-                vals = clim.loc[int(exog_lag_date.month)].to_dict()
-            else:
-                vals = row.iloc[0][EXOG_COLS].to_dict()
+        # Use lag1 exog at previous month
+        exog_lag_date = (next_date - pd.DateOffset(months=1)).to_period("M").to_timestamp()
 
-            for c in EXOG_COLS:
+        if need_meteo:
+            row = ed.loc[ed["date"] == exog_lag_date] if ed is not None else pd.DataFrame()
+            if len(row) == 0 and clim_meteo is not None:
+                vals = clim_meteo.loc[int(exog_lag_date.month)].to_dict()
+            else:
+                vals = row.iloc[0][EXOG_METEO_COLS].to_dict()
+
+            for c in EXOG_METEO_COLS:
                 feats[f"{c}_lag1"] = float(vals[c])
 
-        X = pd.DataFrame([feats]).to_numpy()
+        if need_demand:
+            row = ed.loc[ed["date"] == exog_lag_date] if ed is not None else pd.DataFrame()
+            if len(row) == 0 and clim_demand is not None:
+                dval = float(clim_demand.loc[int(exog_lag_date.month)])
+            else:
+                dval = float(pd.to_numeric(row.iloc[0][DEMAND_COL], errors="coerce"))
+
+            feats["demand_lag1"] = dval
+
+        X = pd.DataFrame([[feats[c] for c in feat_cols]], columns=feat_cols).to_numpy()
         delta_pred = float(model.predict(X)[0])
 
         y_next = max(0.0, y_lag1 + delta_pred)
@@ -299,10 +350,20 @@ def run_point(df_point: pd.DataFrame, cfg: RunConfig) -> Tuple[pd.DataFrame, pd.
     last_date = _to_month_start(dfp["date"].max())
     cutoff = _to_month_start(last_date - pd.DateOffset(months=int(cfg.holdout_months)))
 
+    # Candidate families (data-driven)
+    has_meteo = (
+        all(c in dfp.columns for c in EXOG_METEO_COLS)
+        and dfp[EXOG_METEO_COLS].notna().any().all()
+    )
+    has_demand = (DEMAND_COL in dfp.columns) and pd.to_numeric(dfp[DEMAND_COL], errors="coerce").notna().any()
+
     families = ["ENDO_ML"]
-    has_exog = all(c in dfp.columns for c in EXOG_COLS)
-    if has_exog:
+    if has_meteo:
         families.append("EXOG_ML")
+    if has_demand:
+        families.append("DEMAND_ML")           # <-- demand without meteo supported
+    if has_meteo and has_demand:
+        families.append("EXOG_ML_DEMAND")      # <-- both
     families.append("BASELINE_SEASONAL")
 
     warnings: List[str] = []
@@ -320,9 +381,15 @@ def run_point(df_point: pd.DataFrame, cfg: RunConfig) -> Tuple[pd.DataFrame, pd.
     model_info: Dict[str, Tuple[object, str, float, float]] = {}  # fam -> (model, model_type, kge_inner, rmse_inner)
 
     exog_df = None
-    if has_exog:
-        exog_df = dfp[["date"] + EXOG_COLS].copy()
-        exog_df["date"] = pd.to_datetime(exog_df["date"]).dt.to_period("M").dt.to_timestamp()
+    exog_cols: List[str] = []
+    if has_meteo:
+        exog_cols += EXOG_METEO_COLS
+    if has_demand:
+        exog_cols += [DEMAND_COL]
+
+    if exog_cols:
+        exog_df = dfp[["date"] + exog_cols].copy()
+        exog_df["date"] = pd.to_datetime(exog_df["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
 
     # Train ML families (DO NOT CRASH if a family fails)
     for fam in families:
@@ -433,12 +500,14 @@ def run_point(df_point: pd.DataFrame, cfg: RunConfig) -> Tuple[pd.DataFrame, pd.
     selected = sorted(families, key=rank_key, reverse=True)[0]
 
     # Decision label
+    is_baseline = (selected == "BASELINE_SEASONAL")
+
     if planning_h[selected] > 0:
-        decision = "MODEL_PLANNING" if selected in ("ENDO_ML", "EXOG_ML") else "BASELINE_PLANNING"
+        decision = "MODEL_PLANNING" if not is_baseline else "BASELINE_PLANNING"
         status = "OK"
         reason = ""
     elif advisory_h[selected] > 0:
-        decision = "MODEL_ADVISORY" if selected in ("ENDO_ML", "EXOG_ML") else "BASELINE_ADVISORY"
+        decision = "MODEL_ADVISORY" if not is_baseline else "BASELINE_ADVISORY"
         status = "WARN"
         reason = "ONLY_ADVISORY_GRADE"
     else:

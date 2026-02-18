@@ -949,366 +949,485 @@ st.download_button(
 st.markdown("---")
 st.header(tr("meteo_header"))
 
+# ---- Persistent state keys (do NOT overwrite every rerun) ----
+if "meteo_step_done" not in st.session_state:
+    st.session_state["meteo_step_done"] = False
+if "meteo_info" not in st.session_state:
+    st.session_state["meteo_info"] = None
+
 canonical_df = st.session_state["canonical_df"].copy()
 canonical_df["date"] = to_month_start(canonical_df["date"])
 canonical_df["point_id"] = canonical_df["point_id"].astype(str)
 
-if canonical_has_meteo(canonical_df):
+def _make_meteo_info(source: str, extra: dict | None = None) -> dict:
+    extra = dict(extra or {})
+    info = {
+        "source": source,  # e.g., NASA_POWER_MONTHLY / USER_UPLOAD / ENDO_ONLY / ALREADY_PRESENT
+        "n_points": int(canonical_df["point_id"].nunique()),
+        "n_rows": int(len(canonical_df)),
+        "date_min": str(pd.to_datetime(canonical_df["date"].min(), errors="coerce").date()),
+        "date_max": str(pd.to_datetime(canonical_df["date"].max(), errors="coerce").date()),
+        "meteo_cols_expected": list(METEO_COLS),
+    }
+    info.update(extra)
+    return info
+
+def _show_meteo_coverage(df: pd.DataFrame):
+    cols = [c for c in METEO_COLS if c in df.columns]
+    if not cols:
+        st.warning("No meteo columns found in canonical_with_meteo.")
+        return
+    cov = {c: f"{int(df[c].notna().sum())}/{len(df)}" for c in cols}
+    st.caption("Meteo coverage (non-null / total rows):")
+    st.json(cov)
+
+# ---- If the meteo step was already resolved in this session, do not re-ask ----
+if st.session_state.get("meteo_step_done", False) and st.session_state.get("canonical_with_meteo", None) is not None:
     st.success(tr("meteo_already_present"))
-    st.session_state["canonical_with_meteo"] = canonical_df
+    cwm = st.session_state["canonical_with_meteo"].copy()
+    cwm["date"] = to_month_start(cwm["date"])
+    cwm["point_id"] = cwm["point_id"].astype(str)
+
+    # Best-effort: if meteo_info missing, set a minimal one
+    if st.session_state.get("meteo_info") is None:
+        st.session_state["meteo_info"] = _make_meteo_info(
+            source="ALREADY_IN_SESSION",
+            extra={"note": "meteo_step_done was True; using existing canonical_with_meteo from session."},
+        )
+
+    with st.expander("Meteo provenance (paper-friendly)"):
+        st.json(st.session_state.get("meteo_info"))
+
+    _show_meteo_coverage(cwm)
+
+    # Optional: allow user to change decision safely
+    if st.button("🔁 Change meteorology option", key="meteo_reset_btn"):
+        st.session_state["meteo_step_done"] = False
+        st.session_state["meteo_info"] = None
+        st.session_state["meteo_df"] = None
+        st.session_state["canonical_with_meteo"] = None
+        st.rerun()
+
 else:
-    st.warning(tr("meteo_missing"))
+    # If canonical input already contains meteo columns, accept it directly
+    if canonical_has_meteo(canonical_df):
+        st.success(tr("meteo_already_present"))
+        st.session_state["canonical_with_meteo"] = canonical_df
+        st.session_state["meteo_step_done"] = True
+        st.session_state["meteo_info"] = _make_meteo_info(
+            source="ALREADY_PRESENT_IN_INPUT",
+            extra={"note": "canonical_df already had meteo columns at input stage."},
+        )
+    else:
+        st.warning(tr("meteo_missing"))
 
-    choice = st.radio(
-        tr("meteo_choice_prompt"),
-        [
-            tr("meteo_choice_a"),
-            tr("meteo_choice_b"),
-            tr("meteo_choice_c"),
-        ],
-        index=1,
-        key="meteo_choice",
-    )
+        choice = st.radio(
+            tr("meteo_choice_prompt"),
+            [
+                tr("meteo_choice_a"),
+                tr("meteo_choice_b"),
+                tr("meteo_choice_c"),
+            ],
+            index=1,
+            key="meteo_choice",
+        )
 
-    # A) Upload meteo
-    if choice == tr("meteo_choice_a"):
-        st.subheader(tr("meteo_a_title"))
-        meteo_upload = st.file_uploader(tr("meteo_a_uploader"), type=["csv", "xlsx", "xls"], key="meteo_upload")
+        # A) Upload meteo
+        if choice == tr("meteo_choice_a"):
+            st.subheader(tr("meteo_a_title"))
+            meteo_upload = st.file_uploader(tr("meteo_a_uploader"), type=["csv", "xlsx", "xls"], key="meteo_upload")
 
-        if meteo_upload is not None:
-            raw = read_table_from_upload(meteo_upload)
-            st.write(tr("preview"))
-            st.dataframe(raw.head(20), use_container_width=True)
+            if meteo_upload is not None:
+                raw = read_table_from_upload(meteo_upload)
+                st.write(tr("preview"))
+                st.dataframe(raw.head(20), use_container_width=True)
 
-            cols = list(raw.columns)
-            if len(cols) < 2:
-                st.error(tr("meteo_a_not_enough_cols"))
-                st.stop()
-
-            # Guesses
-            met_date_guess = _guess_date_col(cols)
-            met_precip_guess = next((c for c in cols if "precip" in str(c).lower() or "rain" in str(c).lower() or "lluv" in str(c).lower()), cols[0])
-            met_t2m_guess = next((c for c in cols if "t2m" in str(c).lower() or ("temp" in str(c).lower() and "max" not in str(c).lower() and "min" not in str(c).lower())), cols[0])
-            met_tmax_guess = next((c for c in cols if "tmax" in str(c).lower() or "max" in str(c).lower()), cols[0])
-            met_tmin_guess = next((c for c in cols if "tmin" in str(c).lower() or "min" in str(c).lower()), cols[0])
-            met_pid_guess = next((c for c in cols if "point_id" in str(c).lower() or str(c).lower() == "id" or "point" in str(c).lower()), "")
-
-            NONE_OPT = "__NONE__"
-
-            def _fmt_none(x: str) -> str:
-                if x == NONE_OPT:
-                    return tr("— No tengo este valor —", "— I don't have this value —", LANG)
-                return str(x)
-
-            opt_cols = [NONE_OPT] + cols
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                met_date_col = st.selectbox(
-                    tr("Date column", "Date column", LANG),
-                    cols,
-                    index=cols.index(met_date_guess) if met_date_guess in cols else 0,
-                    key="met_date_col",
-                )
-                met_precip_sel = st.selectbox(
-                    tr("Precipitation column", "Precipitation column", LANG),
-                    opt_cols,
-                    index=(1 + cols.index(met_precip_guess)) if met_precip_guess in cols else 0,
-                    format_func=_fmt_none,
-                    key="met_precip_col",
-                )
-            with c2:
-                met_t2m_sel = st.selectbox(
-                    tr("Mean temperature (T2M) column", "Mean temperature (T2M) column", LANG),
-                    opt_cols,
-                    index=(1 + cols.index(met_t2m_guess)) if met_t2m_guess in cols else 0,
-                    format_func=_fmt_none,
-                    key="met_t2m_col",
-                )
-                met_tmax_sel = st.selectbox(
-                    tr("Max temperature (Tmax) column", "Max temperature (Tmax) column", LANG),
-                    opt_cols,
-                    index=(1 + cols.index(met_tmax_guess)) if met_tmax_guess in cols else 0,
-                    format_func=_fmt_none,
-                    key="met_tmax_col",
-                )
-            with c3:
-                met_tmin_sel = st.selectbox(
-                    tr("Min temperature (Tmin) column", "Min temperature (Tmin) column", LANG),
-                    opt_cols,
-                    index=(1 + cols.index(met_tmin_guess)) if met_tmin_guess in cols else 0,
-                    format_func=_fmt_none,
-                    key="met_tmin_col",
-                )
-
-            fill_missing_with_nasa = st.checkbox(
-                tr("Completar valores faltantes con NASA POWER (recomendado)",
-                   "Fill missing values with NASA POWER (recommended)", LANG),
-                value=True,
-                key="met_fill_missing_with_nasa",
-            )
-
-            mode = st.radio(
-                tr("meteo_has_point_id_q"),
-                [tr("yes_has_point_id"), tr("no_single_point"), tr("no_common_all")],
-                index=0 if met_pid_guess else 2,
-                key="met_mode",
-            )
-
-            point_id_col = ""
-            single_point = ""
-            unique_points = sorted(canonical_df["point_id"].unique().tolist())
-
-            if mode == tr("yes_has_point_id"):
-                point_id_col = st.selectbox(
-                    tr("meteo_col_point_id"),
-                    ["(choose)"] + cols,
-                    index=(cols.index(met_pid_guess) + 1) if met_pid_guess in cols else 0,
-                    key="met_point_id_col",
-                )
-                if point_id_col == "(choose)":
-                    st.error(tr("meteo_need_point_id"))
+                cols = list(raw.columns)
+                if len(cols) < 2:
+                    st.error(tr("meteo_a_not_enough_cols"))
                     st.stop()
-                mode_key = "HAS_POINT_ID"
-            elif mode == tr("no_single_point"):
-                single_point = st.selectbox(tr("meteo_for_which_point"), unique_points, key="met_single_point")
-                mode_key = "SINGLE_POINT"
-            else:
-                mode_key = "COMMON_ALL"
 
-            raw2 = raw.copy()
+                # Guesses
+                met_date_guess = _guess_date_col(cols)
+                met_precip_guess = next((c for c in cols if "precip" in str(c).lower() or "rain" in str(c).lower() or "lluv" in str(c).lower()), cols[0])
+                met_t2m_guess = next((c for c in cols if "t2m" in str(c).lower() or ("temp" in str(c).lower() and "max" not in str(c).lower() and "min" not in str(c).lower())), cols[0])
+                met_tmax_guess = next((c for c in cols if "tmax" in str(c).lower() or "max" in str(c).lower()), cols[0])
+                met_tmin_guess = next((c for c in cols if "tmin" in str(c).lower() or "min" in str(c).lower()), cols[0])
+                met_pid_guess = next((c for c in cols if "point_id" in str(c).lower() or str(c).lower() == "id" or "point" in str(c).lower()), "")
 
-            def _ensure_col(sel: str, placeholder_name: str) -> str:
-                if sel == NONE_OPT:
-                    if placeholder_name not in raw2.columns:
-                        raw2[placeholder_name] = np.nan
-                    return placeholder_name
-                return sel
+                NONE_OPT = "__NONE__"
 
-            met_precip_col = _ensure_col(met_precip_sel, "_missing_precip")
-            met_t2m_col = _ensure_col(met_t2m_sel, "_missing_t2m")
-            met_tmax_col = _ensure_col(met_tmax_sel, "_missing_tmax")
-            met_tmin_col = _ensure_col(met_tmin_sel, "_missing_tmin")
+                def _fmt_none(x: str) -> str:
+                    if x == NONE_OPT:
+                        return tr("— No tengo este valor —", "— I don't have this value —", LANG)
+                    return str(x)
 
-            met_map = MeteoMapping(
-                date_col=met_date_col,
-                precip_col=met_precip_col,
-                t2m_col=met_t2m_col,
-                tmax_col=met_tmax_col,
-                tmin_col=met_tmin_col,
-                point_id_col=point_id_col if mode_key == "HAS_POINT_ID" else "",
-            )
+                opt_cols = [NONE_OPT] + cols
 
-            pts_tmp = canonical_df.groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
-            coords_ok_all = pts_tmp[["lat", "lon"]].notna().all(axis=1).all()
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    met_date_col = st.selectbox(
+                        tr("Date column", "Date column", LANG),
+                        cols,
+                        index=cols.index(met_date_guess) if met_date_guess in cols else 0,
+                        key="met_date_col",
+                    )
+                    met_precip_sel = st.selectbox(
+                        tr("Precipitation column", "Precipitation column", LANG),
+                        opt_cols,
+                        index=(1 + cols.index(met_precip_guess)) if met_precip_guess in cols else 0,
+                        format_func=_fmt_none,
+                        key="met_precip_col",
+                    )
+                with c2:
+                    met_t2m_sel = st.selectbox(
+                        tr("Mean temperature (T2M) column", "Mean temperature (T2M) column", LANG),
+                        opt_cols,
+                        index=(1 + cols.index(met_t2m_guess)) if met_t2m_guess in cols else 0,
+                        format_func=_fmt_none,
+                        key="met_t2m_col",
+                    )
+                    met_tmax_sel = st.selectbox(
+                        tr("Max temperature (Tmax) column", "Max temperature (Tmax) column", LANG),
+                        opt_cols,
+                        index=(1 + cols.index(met_tmax_guess)) if met_tmax_guess in cols else 0,
+                        format_func=_fmt_none,
+                        key="met_tmax_col",
+                    )
+                with c3:
+                    met_tmin_sel = st.selectbox(
+                        tr("Min temperature (Tmin) column", "Min temperature (Tmin) column", LANG),
+                        opt_cols,
+                        index=(1 + cols.index(met_tmin_guess)) if met_tmin_guess in cols else 0,
+                        format_func=_fmt_none,
+                        key="met_tmin_col",
+                    )
 
-            if st.button(tr("apply_uploaded_meteo_btn"), key="apply_uploaded_meteo"):
-                try:
-                    user_provided_any = any(sel != NONE_OPT for sel in [met_precip_sel, met_t2m_sel, met_tmax_sel, met_tmin_sel])
+                fill_missing_with_nasa = st.checkbox(
+                    tr("Completar valores faltantes con NASA POWER (recomendado)",
+                       "Fill missing values with NASA POWER (recommended)", LANG),
+                    value=True,
+                    key="met_fill_missing_with_nasa",
+                )
 
-                    if (not user_provided_any) and fill_missing_with_nasa and coords_ok_all:
-                        with st.spinner(tr("meteo_fetching_spinner")):
-                            meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(canonical_df)
-                        st.session_state["meteo_df"] = meteo_df
+                mode = st.radio(
+                    tr("meteo_has_point_id_q"),
+                    [tr("yes_has_point_id"), tr("no_single_point"), tr("no_common_all")],
+                    index=0 if met_pid_guess else 2,
+                    key="met_mode",
+                )
+
+                point_id_col = ""
+                single_point = ""
+                unique_points = sorted(canonical_df["point_id"].unique().tolist())
+
+                if mode == tr("yes_has_point_id"):
+                    point_id_col = st.selectbox(
+                        tr("meteo_col_point_id"),
+                        ["(choose)"] + cols,
+                        index=(cols.index(met_pid_guess) + 1) if met_pid_guess in cols else 0,
+                        key="met_point_id_col",
+                    )
+                    if point_id_col == "(choose)":
+                        st.error(tr("meteo_need_point_id"))
+                        st.stop()
+                    mode_key = "HAS_POINT_ID"
+                elif mode == tr("no_single_point"):
+                    single_point = st.selectbox(tr("meteo_for_which_point"), unique_points, key="met_single_point")
+                    mode_key = "SINGLE_POINT"
+                else:
+                    mode_key = "COMMON_ALL"
+
+                raw2 = raw.copy()
+
+                def _ensure_col(sel: str, placeholder_name: str) -> str:
+                    if sel == NONE_OPT:
+                        if placeholder_name not in raw2.columns:
+                            raw2[placeholder_name] = np.nan
+                        return placeholder_name
+                    return sel
+
+                met_precip_col = _ensure_col(met_precip_sel, "_missing_precip")
+                met_t2m_col = _ensure_col(met_t2m_sel, "_missing_t2m")
+                met_tmax_col = _ensure_col(met_tmax_sel, "_missing_tmax")
+                met_tmin_col = _ensure_col(met_tmin_sel, "_missing_tmin")
+
+                met_map = MeteoMapping(
+                    date_col=met_date_col,
+                    precip_col=met_precip_col,
+                    t2m_col=met_t2m_col,
+                    tmax_col=met_tmax_col,
+                    tmin_col=met_tmin_col,
+                    point_id_col=point_id_col if mode_key == "HAS_POINT_ID" else "",
+                )
+
+                pts_tmp = canonical_df.groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
+                coords_ok_all = pts_tmp[["lat", "lon"]].notna().all(axis=1).all()
+
+                if st.button(tr("apply_uploaded_meteo_btn"), key="apply_uploaded_meteo"):
+                    try:
+                        user_provided_any = any(sel != NONE_OPT for sel in [met_precip_sel, met_t2m_sel, met_tmax_sel, met_tmin_sel])
+
+                        if (not user_provided_any) and fill_missing_with_nasa and coords_ok_all:
+                            with st.spinner(tr("meteo_fetching_spinner")):
+                                meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(canonical_df)
+                            st.session_state["meteo_df"] = meteo_df
+                            st.session_state["canonical_with_meteo"] = canonical_with_meteo
+                            st.session_state["meteo_step_done"] = True
+                            st.session_state["meteo_info"] = _make_meteo_info(
+                                source="NASA_POWER_MONTHLY",
+                                extra={
+                                    "choice": "A_UPLOAD_BUT_EMPTY_USED_NASA",
+                                    "fill_missing_with_nasa": True,
+                                    "coords_ok_all": True,
+                                    "nasa_parameters": ["T2M", "T2M_MAX", "T2M_MIN", "PRECTOTCORR", "PRECTOT"],
+                                    "nasa_temporal": "monthly",
+                                },
+                            )
+                            st.success(tr("No aportaste variables meteo; he usado NASA POWER automáticamente.",
+                                          "You didn't provide meteo variables; NASA POWER was used automatically.", LANG))
+                            st.rerun()
+
+                        meteo_df = build_user_meteo_table(
+                            raw=raw2,
+                            canonical_point_ids=unique_points,
+                            mapping=met_map,
+                            mode=mode_key,
+                            single_point_id=single_point,
+                        )
+
+                        canonical_with_meteo = canonical_df.merge(
+                            meteo_df[["point_id", "date"] + METEO_COLS + ["source"]],
+                            on=["point_id", "date"],
+                            how="left",
+                        )
+
+                        if {"t2m_c", "tmax_c", "tmin_c"}.issubset(set(canonical_with_meteo.columns)):
+                            m = (
+                                canonical_with_meteo["t2m_c"].isna()
+                                & canonical_with_meteo["tmax_c"].notna()
+                                & canonical_with_meteo["tmin_c"].notna()
+                            )
+                            canonical_with_meteo.loc[m, "t2m_c"] = (
+                                canonical_with_meteo.loc[m, "tmax_c"] + canonical_with_meteo.loc[m, "tmin_c"]
+                            ) / 2.0
+
+                        needs_fill = canonical_with_meteo[METEO_COLS].isna().any().any()
+                        filled_any = pd.Series(False, index=canonical_with_meteo.index)
+
+                        if fill_missing_with_nasa and coords_ok_all and needs_fill:
+                            with st.spinner(tr("meteo_fetching_spinner")):
+                                _met_nasa, cwm_nasa = fetch_nasa_power_for_canonical(canonical_df)
+                            for c in METEO_COLS:
+                                mask = canonical_with_meteo[c].isna() & cwm_nasa[c].notna()
+                                if mask.any():
+                                    canonical_with_meteo.loc[mask, c] = cwm_nasa.loc[mask, c]
+                                    filled_any |= mask
+
+                        user_any_before = canonical_with_meteo[METEO_COLS].notna().any(axis=1)
+                        source = np.where(user_any_before, "USER_UPLOAD", "NONE")
+                        source = np.where(filled_any & user_any_before, "MIXED_NASA", source)
+                        source = np.where(filled_any & ~user_any_before, "NASA_POWER_MONTHLY", source)
+                        canonical_with_meteo["source"] = source
+
+                        meteo_df_final = canonical_with_meteo[["point_id", "date"] + METEO_COLS + ["source"]].copy()
+                        st.session_state["meteo_df"] = meteo_df_final
                         st.session_state["canonical_with_meteo"] = canonical_with_meteo
-                        st.success(tr("No aportaste variables meteo; he usado NASA POWER automáticamente.",
-                                      "You didn't provide meteo variables; NASA POWER was used automatically.", LANG))
+                        st.session_state["meteo_step_done"] = True
+
+                        st.session_state["meteo_info"] = _make_meteo_info(
+                            source="USER_UPLOAD" if not fill_missing_with_nasa else "USER_UPLOAD_WITH_OPTIONAL_NASA_FILL",
+                            extra={
+                                "choice": "A_UPLOAD",
+                                "file_name": getattr(meteo_upload, "name", "UNKNOWN"),
+                                "mode": mode_key,
+                                "single_point_id": str(single_point) if mode_key == "SINGLE_POINT" else None,
+                                "mapping": {
+                                    "date_col": str(met_date_col),
+                                    "precip_col": str(met_precip_col),
+                                    "t2m_col": str(met_t2m_col),
+                                    "tmax_col": str(met_tmax_col),
+                                    "tmin_col": str(met_tmin_col),
+                                    "point_id_col": str(point_id_col) if mode_key == "HAS_POINT_ID" else None,
+                                },
+                                "fill_missing_with_nasa": bool(fill_missing_with_nasa),
+                                "coords_ok_all": bool(coords_ok_all),
+                                "n_rows_filled_any_nasa": int(filled_any.sum()) if fill_missing_with_nasa else 0,
+                                "n_rows_user_any": int(user_any_before.sum()),
+                                "nasa_parameters": ["T2M", "T2M_MAX", "T2M_MIN", "PRECTOTCORR", "PRECTOT"] if fill_missing_with_nasa else None,
+                                "nasa_temporal": "monthly" if fill_missing_with_nasa else None,
+                            },
+                        )
+
+                        st.success(tr("meteo_integrated_ok"))
                         st.rerun()
 
-                    meteo_df = build_user_meteo_table(
-                        raw=raw2,
-                        canonical_point_ids=unique_points,
-                        mapping=met_map,
-                        mode=mode_key,
-                        single_point_id=single_point,
+                    except Exception as e:
+                        st.error(f"{tr('meteo_integrated_err')}: {e}")
+
+        # B) NASA POWER (with coord resolving)
+        elif choice == tr("meteo_choice_b"):
+            st.subheader(tr("meteo_b_title"))
+
+            pts = canonical_df.groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
+            pts["coords_ok"] = pts[["lat", "lon"]].notna().all(axis=1)
+            n_ok = int(pts["coords_ok"].sum())
+            n_total = int(len(pts))
+            n_missing = n_total - n_ok
+
+            st.write(tr("meteo_coords_status").format(n_ok=n_ok, n_total=n_total))
+
+            global_loc = ""
+            loc_df = None
+            loc_pid_col = loc_text_col = loc_lat_col = loc_lon_col = None
+
+            if n_missing > 0:
+                st.warning(tr("meteo_coords_missing").format(n_missing=n_missing))
+                st.dataframe(pts, use_container_width=True)
+
+                st.markdown(tr("meteo_fix_coords_title"))
+                global_loc = st.text_input(tr("meteo_global_location"), value="", key="global_loc")
+
+                loc_upload = st.file_uploader(tr("meteo_locations_upload"), type=["csv", "xlsx", "xls"], key="loc_upload")
+                if loc_upload is not None:
+                    loc_df = read_table_from_upload(loc_upload)
+                    st.write(tr("preview"))
+                    st.dataframe(loc_df.head(20), use_container_width=True)
+
+                    cols = list(loc_df.columns)
+                    pid_guess = next((c for c in cols if "point" in str(c).lower() or str(c).lower() == "id" or "point_id" in str(c).lower()), cols[0])
+                    loc_guess = next((c for c in cols if "loc" in str(c).lower() or "city" in str(c).lower() or "municip" in str(c).lower() or "place" in str(c).lower() or "name" in str(c).lower()), "")
+                    lat_guess = next((c for c in cols if str(c).lower() in ("lat", "latitude")), "")
+                    lon_guess = next((c for c in cols if str(c).lower() in ("lon", "longitude", "lng")), "")
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        loc_pid_col = st.selectbox(tr("loc_col_point_id"), cols, index=cols.index(pid_guess) if pid_guess in cols else 0, key="loc_pid_col")
+                        loc_text_col = st.selectbox(tr("loc_col_location"), ["(none)"] + cols, index=(cols.index(loc_guess) + 1) if loc_guess in cols else 0, key="loc_text_col")
+                    with c2:
+                        loc_lat_col = st.selectbox(tr("loc_col_lat"), ["(none)"] + cols, index=(cols.index(lat_guess) + 1) if lat_guess in cols else 0, key="loc_lat_col")
+                        loc_lon_col = st.selectbox(tr("loc_col_lon"), ["(none)"] + cols, index=(cols.index(lon_guess) + 1) if lon_guess in cols else 0, key="loc_lon_col")
+
+            if n_ok > 0 and st.checkbox(tr("meteo_show_reverse"), value=False, key="rev_geo_chk"):
+                rows = []
+                for _, r in pts[pts["coords_ok"]].head(8).iterrows():
+                    rr = reverse_geocode(float(r["lat"]), float(r["lon"]))
+                    rows.append(
+                        {
+                            "point_id": r["point_id"],
+                            "lat": r["lat"],
+                            "lon": r["lon"],
+                            "approx_location": rr.label if rr else "",
+                            "confidence": rr.confidence if rr else "",
+                        }
                     )
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-                    canonical_with_meteo = canonical_df.merge(
-                        meteo_df[["point_id", "date"] + METEO_COLS + ["source"]],
-                        on=["point_id", "date"],
-                        how="left",
-                    )
-
-                    if {"t2m_c", "tmax_c", "tmin_c"}.issubset(set(canonical_with_meteo.columns)):
-                        m = (
-                            canonical_with_meteo["t2m_c"].isna()
-                            & canonical_with_meteo["tmax_c"].notna()
-                            & canonical_with_meteo["tmin_c"].notna()
-                        )
-                        canonical_with_meteo.loc[m, "t2m_c"] = (
-                            canonical_with_meteo.loc[m, "tmax_c"] + canonical_with_meteo.loc[m, "tmin_c"]
-                        ) / 2.0
-
-                    needs_fill = canonical_with_meteo[METEO_COLS].isna().any().any()
-                    filled_any = pd.Series(False, index=canonical_with_meteo.index)
-
-                    if fill_missing_with_nasa and coords_ok_all and needs_fill:
-                        with st.spinner(tr("meteo_fetching_spinner")):
-                            _met_nasa, cwm_nasa = fetch_nasa_power_for_canonical(canonical_df)
-                        for c in METEO_COLS:
-                            mask = canonical_with_meteo[c].isna() & cwm_nasa[c].notna()
-                            if mask.any():
-                                canonical_with_meteo.loc[mask, c] = cwm_nasa.loc[mask, c]
-                                filled_any |= mask
-
-                    user_any_before = canonical_with_meteo[METEO_COLS].notna().any(axis=1)
-                    source = np.where(user_any_before, "USER_UPLOAD", "NONE")
-                    source = np.where(filled_any & user_any_before, "MIXED_NASA", source)
-                    source = np.where(filled_any & ~user_any_before, "NASA_POWER_MONTHLY", source)
-                    canonical_with_meteo["source"] = source
-
-                    meteo_df_final = canonical_with_meteo[["point_id", "date"] + METEO_COLS + ["source"]].copy()
-                    st.session_state["meteo_df"] = meteo_df_final
-                    st.session_state["canonical_with_meteo"] = canonical_with_meteo
-
-                    st.success(tr("meteo_integrated_ok"))
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(f"{tr('meteo_integrated_err')}: {e}")
-
-    # B) NASA POWER (with coord resolving)
-    elif choice == tr("meteo_choice_b"):
-        st.subheader(tr("meteo_b_title"))
-
-        pts = canonical_df.groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
-        pts["coords_ok"] = pts[["lat", "lon"]].notna().all(axis=1)
-        n_ok = int(pts["coords_ok"].sum())
-        n_total = int(len(pts))
-        n_missing = n_total - n_ok
-
-        st.write(tr("meteo_coords_status").format(n_ok=n_ok, n_total=n_total))
-
-        global_loc = ""
-        loc_df = None
-        loc_pid_col = loc_text_col = loc_lat_col = loc_lon_col = None
-
-        if n_missing > 0:
-            st.warning(tr("meteo_coords_missing").format(n_missing=n_missing))
-            st.dataframe(pts, use_container_width=True)
-
-            st.markdown(tr("meteo_fix_coords_title"))
-            global_loc = st.text_input(tr("meteo_global_location"), value="", key="global_loc")
-
-            loc_upload = st.file_uploader(tr("meteo_locations_upload"), type=["csv", "xlsx", "xls"], key="loc_upload")
-            if loc_upload is not None:
-                loc_df = read_table_from_upload(loc_upload)
-                st.write(tr("preview"))
-                st.dataframe(loc_df.head(20), use_container_width=True)
-
-                cols = list(loc_df.columns)
-                pid_guess = next((c for c in cols if "point" in str(c).lower() or str(c).lower() == "id" or "point_id" in str(c).lower()), cols[0])
-                loc_guess = next((c for c in cols if "loc" in str(c).lower() or "city" in str(c).lower() or "municip" in str(c).lower() or "place" in str(c).lower() or "name" in str(c).lower()), "")
-                lat_guess = next((c for c in cols if str(c).lower() in ("lat", "latitude")), "")
-                lon_guess = next((c for c in cols if str(c).lower() in ("lon", "longitude", "lng")), "")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    loc_pid_col = st.selectbox(tr("loc_col_point_id"), cols, index=cols.index(pid_guess) if pid_guess in cols else 0, key="loc_pid_col")
-                    loc_text_col = st.selectbox(tr("loc_col_location"), ["(none)"] + cols, index=(cols.index(loc_guess) + 1) if loc_guess in cols else 0, key="loc_text_col")
-                with c2:
-                    loc_lat_col = st.selectbox(tr("loc_col_lat"), ["(none)"] + cols, index=(cols.index(lat_guess) + 1) if lat_guess in cols else 0, key="loc_lat_col")
-                    loc_lon_col = st.selectbox(tr("loc_col_lon"), ["(none)"] + cols, index=(cols.index(lon_guess) + 1) if lon_guess in cols else 0, key="loc_lon_col")
-
-        if n_ok > 0 and st.checkbox(tr("meteo_show_reverse"), value=False, key="rev_geo_chk"):
-            rows = []
-            for _, r in pts[pts["coords_ok"]].head(8).iterrows():
-                rr = reverse_geocode(float(r["lat"]), float(r["lon"]))
-                rows.append(
-                    {
-                        "point_id": r["point_id"],
-                        "lat": r["lat"],
-                        "lon": r["lon"],
-                        "approx_location": rr.label if rr else "",
-                        "confidence": rr.confidence if rr else "",
-                    }
-                )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-        if n_missing > 0 and st.button(tr("meteo_resolve_coords_btn"), key="resolve_coords"):
-            try:
-                pts2 = pts.copy()
-
-                # 1) Per-point fill from locations file
-                if loc_df is not None and loc_pid_col:
-                    loc_map = {}
-                    for _, rr in loc_df.iterrows():
-                        pid = str(rr.get(loc_pid_col, "")).strip()
-                        if not pid:
-                            continue
-
-                        latv = None
-                        lonv = None
-
-                        if loc_lat_col and loc_lat_col != "(none)" and loc_lon_col and loc_lon_col != "(none)":
-                            try:
-                                latv = float(str(rr.get(loc_lat_col)).replace(",", "."))
-                                lonv = float(str(rr.get(loc_lon_col)).replace(",", "."))
-                            except Exception:
-                                latv = lonv = None
-
-                        if (latv is None or lonv is None) and loc_text_col and loc_text_col != "(none)":
-                            q = str(rr.get(loc_text_col, "")).strip()
-                            gr = geocode_place(q) if q else None
-                            if gr:
-                                latv, lonv = gr.lat, gr.lon
-
-                        if latv is not None and lonv is not None:
-                            loc_map[pid] = (latv, lonv)
-
-                    def _fill(row):
-                        if row["coords_ok"]:
-                            return row
-                        pid = str(row["point_id"])
-                        if pid in loc_map:
-                            row["lat"] = loc_map[pid][0]
-                            row["lon"] = loc_map[pid][1]
-                            row["coords_ok"] = True
-                        return row
-
-                    pts2 = pts2.apply(_fill, axis=1)
-
-                # 2) Global fallback
-                still_missing = pts2[~pts2["coords_ok"]]
-                gl = (global_loc or "").strip()
-                if (not still_missing.empty) and gl:
-                    gr = geocode_place(gl)
-                    if gr:
-                        pts2.loc[~pts2["coords_ok"], "lat"] = gr.lat
-                        pts2.loc[~pts2["coords_ok"], "lon"] = gr.lon
-                        pts2["coords_ok"] = pts2[["lat", "lon"]].notna().all(axis=1)
-
-                pt_lookup = dict(zip(pts2["point_id"].astype(str), zip(pts2["lat"], pts2["lon"])))
-                canonical_df2 = canonical_df.copy()
-                canonical_df2["lat"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[0])
-                canonical_df2["lon"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[1])
-
-                st.session_state["canonical_df"] = canonical_df2
-                st.success(tr("meteo_coords_resolved_ok"))
-                st.rerun()
-            except Exception as e:
-                st.error(f"{tr('meteo_coords_resolved_err')}: {e}")
-
-        pts3 = st.session_state["canonical_df"].groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
-        coords_ok_all = pts3[["lat", "lon"]].notna().all(axis=1).all()
-
-        if coords_ok_all:
-            if st.button(tr("meteo_fetch_nasa_btn"), key="fetch_nasa_power"):
+            if n_missing > 0 and st.button(tr("meteo_resolve_coords_btn"), key="resolve_coords"):
                 try:
-                    with st.spinner(tr("meteo_fetching_spinner")):
-                        meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(st.session_state["canonical_df"])
-                    st.session_state["meteo_df"] = meteo_df
-                    st.session_state["canonical_with_meteo"] = canonical_with_meteo
-                    st.success(tr("meteo_nasa_ok"))
-                except Exception as e:
-                    st.error(f"{tr('meteo_nasa_err')}: {e}")
-        else:
-            st.info(tr("meteo_need_coords_or_other_option"))
+                    pts2 = pts.copy()
 
-    # C) ENDO only
-    else:
-        st.info(tr("meteo_endo_only_info"))
-        st.session_state["canonical_with_meteo"] = canonical_df.copy()
+                    # 1) Per-point fill from locations file
+                    if loc_df is not None and loc_pid_col:
+                        loc_map = {}
+                        for _, rr in loc_df.iterrows():
+                            pid = str(rr.get(loc_pid_col, "")).strip()
+                            if not pid:
+                                continue
+
+                            latv = None
+                            lonv = None
+
+                            if loc_lat_col and loc_lat_col != "(none)" and loc_lon_col and loc_lon_col != "(none)":
+                                try:
+                                    latv = float(str(rr.get(loc_lat_col)).replace(",", "."))
+                                    lonv = float(str(rr.get(loc_lon_col)).replace(",", "."))
+                                except Exception:
+                                    latv = lonv = None
+
+                            if (latv is None or lonv is None) and loc_text_col and loc_text_col != "(none)":
+                                q = str(rr.get(loc_text_col, "")).strip()
+                                gr = geocode_place(q) if q else None
+                                if gr:
+                                    latv, lonv = gr.lat, gr.lon
+
+                            if latv is not None and lonv is not None:
+                                loc_map[pid] = (latv, lonv)
+
+                        def _fill(row):
+                            if row["coords_ok"]:
+                                return row
+                            pid = str(row["point_id"])
+                            if pid in loc_map:
+                                row["lat"] = loc_map[pid][0]
+                                row["lon"] = loc_map[pid][1]
+                                row["coords_ok"] = True
+                            return row
+
+                        pts2 = pts2.apply(_fill, axis=1)
+
+                    # 2) Global fallback
+                    still_missing = pts2[~pts2["coords_ok"]]
+                    gl = (global_loc or "").strip()
+                    if (not still_missing.empty) and gl:
+                        gr = geocode_place(gl)
+                        if gr:
+                            pts2.loc[~pts2["coords_ok"], "lat"] = gr.lat
+                            pts2.loc[~pts2["coords_ok"], "lon"] = gr.lon
+                            pts2["coords_ok"] = pts2[["lat", "lon"]].notna().all(axis=1)
+
+                    pt_lookup = dict(zip(pts2["point_id"].astype(str), zip(pts2["lat"], pts2["lon"])))
+                    canonical_df2 = canonical_df.copy()
+                    canonical_df2["lat"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[0])
+                    canonical_df2["lon"] = canonical_df2["point_id"].map(lambda x: pt_lookup.get(str(x), (np.nan, np.nan))[1])
+
+                    # IMPORTANT: coords changed => meteo should be re-run
+                    st.session_state["canonical_df"] = canonical_df2
+                    st.session_state["canonical_with_meteo"] = None
+                    st.session_state["meteo_df"] = None
+                    st.session_state["meteo_info"] = None
+                    st.session_state["meteo_step_done"] = False
+
+                    st.success(tr("meteo_coords_resolved_ok"))
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"{tr('meteo_coords_resolved_err')}: {e}")
+
+            pts3 = st.session_state["canonical_df"].groupby("point_id", as_index=False).agg({"lat": "first", "lon": "first"})
+            coords_ok_all = pts3[["lat", "lon"]].notna().all(axis=1).all()
+
+            if coords_ok_all:
+                if st.button(tr("meteo_fetch_nasa_btn"), key="fetch_nasa_power"):
+                    try:
+                        with st.spinner(tr("meteo_fetching_spinner")):
+                            meteo_df, canonical_with_meteo = fetch_nasa_power_for_canonical(st.session_state["canonical_df"])
+                        st.session_state["meteo_df"] = meteo_df
+                        st.session_state["canonical_with_meteo"] = canonical_with_meteo
+                        st.session_state["meteo_step_done"] = True
+                        st.session_state["meteo_info"] = _make_meteo_info(
+                            source="NASA_POWER_MONTHLY",
+                            extra={
+                                "choice": "B_NASA_POWER",
+                                "coords_ok_all": True,
+                                "nasa_parameters": ["T2M", "T2M_MAX", "T2M_MIN", "PRECTOTCORR", "PRECTOT"],
+                                "nasa_temporal": "monthly",
+                            },
+                        )
+                        st.success(tr("meteo_nasa_ok"))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"{tr('meteo_nasa_err')}: {e}")
+            else:
+                st.info(tr("meteo_need_coords_or_other_option"))
+
+        # C) ENDO only
+        else:
+            st.info(tr("meteo_endo_only_info"))
+            st.session_state["canonical_with_meteo"] = canonical_df.copy()
+            st.session_state["meteo_df"] = None
+            st.session_state["meteo_step_done"] = True
+            st.session_state["meteo_info"] = _make_meteo_info(source="ENDO_ONLY", extra={"choice": "C_ENDO_ONLY"})
+            st.rerun()
 
 # Downloads (meteo)
 if "canonical_with_meteo" in st.session_state and st.session_state["canonical_with_meteo"] is not None:
@@ -1320,6 +1439,11 @@ if "canonical_with_meteo" in st.session_state and st.session_state["canonical_wi
         file_name="canonical_with_meteo.csv",
         mime="text/csv",
     )
+
+    # quick coverage readout
+    with st.expander("Meteo coverage check"):
+        _show_meteo_coverage(cwm)
+
 if "meteo_df" in st.session_state and st.session_state["meteo_df"] is not None:
     met = st.session_state["meteo_df"]
     st.download_button(
@@ -1338,11 +1462,14 @@ st.header("📦 Demand (optional)")
 
 from pathlib import Path
 
-base_exog = st.session_state.get("canonical_with_meteo", None)
-if base_exog is None:
+# Base for demand integration: meteo-first if exists, else canonical_df
+_base = st.session_state.get("canonical_with_meteo", None)
+if _base is None:
     base_exog = st.session_state["canonical_df"].copy()
+    base_mode = "NO_METEO"
 else:
-    base_exog = base_exog.copy()
+    base_exog = _base.copy()
+    base_mode = "WITH_METEO"
 
 base_exog["date"] = to_month_start(base_exog["date"])
 base_exog["point_id"] = base_exog["point_id"].astype(str)
@@ -1370,6 +1497,12 @@ if _prev_choice is not None and _prev_choice != demand_choice:
     st.session_state["canonical_with_meteo_and_demand"] = None
     st.session_state["open_demand_info"] = None
 st.session_state["demand_choice_prev_v014"] = demand_choice
+
+# Status (helps avoid "I thought demand was included")
+_cur = st.session_state.get("canonical_with_meteo_and_demand", None)
+if _cur is not None:
+    nn = int(_cur["demand"].notna().sum()) if "demand" in _cur.columns else 0
+    st.info(f"Current integrated demand status: demand column exists={('demand' in _cur.columns)} | non-null rows={nn}")
 
 # -----------------------------
 # Helpers (local fallbacks) — so this block never NameErrors
@@ -1436,11 +1569,6 @@ if demand_choice.startswith("A)"):
                     index=cols.index(dem_val_guess) if dem_val_guess in cols else (1 if len(cols) > 1 else 0),
                     key="dem_val_col_v014",
                 )
-                st.caption(tr(
-                    f"Auto-detected: date='{dem_date_guess}', demand='{dem_val_guess}'",
-                    f"Auto-detected: date='{dem_date_guess}', demand='{dem_val_guess}'",
-                    LANG,
-                ))
 
                 dem_pid_col = None
                 if dem_apply_mode.startswith("HAS_POINT_ID"):
@@ -1475,6 +1603,7 @@ if demand_choice.startswith("A)"):
                     st.session_state["canonical_with_meteo_and_demand"] = merged
                     st.session_state["open_demand_info"] = {
                         "source": "user_upload",
+                        "base_mode": base_mode,
                         "apply_mode": apply_mode,
                         "file_name": getattr(demand_upload, "name", "UNKNOWN"),
                         "date_col": str(dem_date_col),
@@ -1497,7 +1626,7 @@ elif demand_choice.startswith("B)"):
     cache_dir = Path("outputs") / "cache" / "demand"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Fixed "simple" choice (your current validated pair)
+    # Fixed "simple" choice (your validated pair)
     scenario = "ssp1_rcp26"
     gcm = "gfdl"
     file_id_1 = 6062173
@@ -1510,6 +1639,7 @@ elif demand_choice.startswith("B)"):
 
     hist_min = pd.to_datetime(base_exog["date"].min(), errors="coerce")
     hist_max = pd.to_datetime(base_exog["date"].max(), errors="coerce")
+
     if pd.isna(hist_min) or pd.isna(hist_max):
         st.warning("Historical dates are invalid. Continuing safely without demand.")
         st.session_state["canonical_with_meteo_and_demand"] = None
@@ -1520,8 +1650,8 @@ elif demand_choice.startswith("B)"):
         overlap_start = max(hist_min.to_period("M").to_timestamp(), pd.Timestamp("2010-01-01"))
         overlap_end = hist_max.to_period("M").to_timestamp()
         st.caption(f"Demand overlap used: {overlap_start.date()} to {overlap_end.date()}")
-
         st.caption(f"Cache folder: {cache_dir}")
+
         st.write(
             tr("Estado de caché ZIP:", "ZIP cache status:", LANG),
             {
@@ -1536,7 +1666,6 @@ elif demand_choice.startswith("B)"):
             st.success("Cached ZIPs found ✅ (no upload needed).")
         else:
             st.warning("Missing one or both ZIPs. Upload them once below OR enable auto-download (large files).")
-
             c_up1, c_up2 = st.columns(2)
             with c_up1:
                 up1 = st.file_uploader("Upload ZIP 1 (…monthly_1.zip)", type=["zip"], key="open_demand_zip1_upload_v014")
@@ -1583,6 +1712,7 @@ elif demand_choice.startswith("B)"):
                 else:
                     months_needed = list(pd.date_range(start=overlap_start, end=overlap_end, freq="MS"))
 
+                    # bbox requires lat/lon; if missing, skip safely
                     bbox = None
                     if ("lat" in base_exog.columns) and ("lon" in base_exog.columns):
                         lat = pd.to_numeric(base_exog["lat"], errors="coerce")
@@ -1609,10 +1739,15 @@ elif demand_choice.startswith("B)"):
                             fail_soft=True,
                         )
 
-                        # Store provenance for manifest
+                        # Normalize expected column for merge (defensive)
+                        if dem_df is not None and (not dem_df.empty):
+                            if "demand_hm3" not in dem_df.columns and "demand" in dem_df.columns:
+                                dem_df = dem_df.rename(columns={"demand": "demand_hm3"})
+
                         info = dict(info or {})
                         info.update({
                             "source": "dataverse_zip_csv",
+                            "base_mode": base_mode,
                             "scenario": scenario,
                             "gcm": gcm,
                             "file_id_1": int(file_id_1),

@@ -1,112 +1,201 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 
-
 POWER_MONTHLY_ENDPOINT = "https://power.larc.nasa.gov/api/temporal/monthly/point"
-DEFAULT_PARAMS = ["PRECTOT", "T2M", "T2M_MAX", "T2M_MIN"]
 
 
 @dataclass(frozen=True)
 class PowerMonthlyConfig:
+    """
+    Config for NASA POWER monthly point requests.
+
+    Notes:
+    - Some POWER endpoints accept start/end as YYYY (monthly docs show this),
+      but some combinations return 422 in practice. We therefore retry with YYYYMMDD.
+    - We request precipitation separately from temperature for easier fallbacks.
+    """
     community: str = "AG"
-    params: Tuple[str, ...] = tuple(DEFAULT_PARAMS)
-    timeout_s: int = 60
-    cache_dir: str = ".cache/power"
-    round_coords: int = 4  # cache key stability
+    timeout_s: float = 30.0
+    ssl_verify: bool = True
+    cache_dir: Optional[Path] = None
+    user_agent: str = "BasinCast/0.14 (+https://github.com/al16gm/BasinCast)"
+
+    # Requested parameters (we'll fallback if some combo fails)
+    precip_params: Tuple[str, ...] = ("PRECTOTCORR", "PRECTOT")
+    temp_params: Tuple[str, ...] = ("T2M", "T2M_MAX", "T2M_MIN")
+
+    # Retry order for start/end formatting
+    #  - "YYYY"      -> start=2010 end=2011
+    #  - "YYYYMMDD"  -> start=20100101 end=20111231
+    date_formats: Tuple[str, ...] = ("YYYY", "YYYYMMDD")
 
 
-def _month_start(year: int, month: int) -> pd.Timestamp:
-    return pd.Timestamp(year=year, month=month, day=1).to_period("M").to_timestamp()
+def _ensure_cache_dir(cfg: PowerMonthlyConfig) -> Optional[Path]:
+    if cfg.cache_dir is None:
+        return None
+    p = Path(cfg.cache_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def _days_in_month(ts: pd.Timestamp) -> int:
-    # month start -> next month start - 1 day
-    next_m = (ts + pd.DateOffset(months=1)).to_period("M").to_timestamp()
-    return int((next_m - ts).days)
+def _cache_key(lat: float, lon: float, start_year: int, end_year: int, params: Sequence[str], community: str) -> str:
+    s = f"{lat:.6f}|{lon:.6f}|{start_year}|{end_year}|{community}|{','.join(params)}"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
-def _safe_float(x) -> float:
+def _build_start_end(start_year: int, end_year: int, fmt: str) -> Tuple[str, str]:
+    if fmt == "YYYY":
+        return str(int(start_year)), str(int(end_year))
+    if fmt == "YYYYMMDD":
+        return f"{int(start_year)}0101", f"{int(end_year)}1231"
+    raise ValueError(f"Unknown date format: {fmt}")
+
+
+def _power_request_json(
+    *,
+    lat: float,
+    lon: float,
+    start_year: int,
+    end_year: int,
+    params: Sequence[str],
+    cfg: PowerMonthlyConfig,
+    date_fmt: str,
+) -> Dict:
+    start, end = _build_start_end(start_year, end_year, date_fmt)
+
+    q = {
+        "parameters": ",".join(params),
+        "community": cfg.community,
+        "longitude": f"{lon}",
+        "latitude": f"{lat}",
+        "start": start,
+        "end": end,
+        "format": "JSON",
+    }
+    headers = {"User-Agent": cfg.user_agent}
+
+    resp = requests.get(
+        POWER_MONTHLY_ENDPOINT,
+        params=q,
+        timeout=float(cfg.timeout_s),
+        verify=bool(cfg.ssl_verify),
+        headers=headers,
+    )
+
+    # Provide readable error text (POWER returns useful JSON messages)
+    if resp.status_code != 200:
+        txt = resp.text or ""
+        raise RuntimeError(
+            f"NASA POWER request failed status={resp.status_code}. "
+            f"params={tuple(params)} start={start} end={end} lat={lat} lon={lon}. Response: {txt}"
+        )
+    return resp.json()
+
+
+def _try_power_request_with_fallbacks(
+    *,
+    lat: float,
+    lon: float,
+    start_year: int,
+    end_year: int,
+    params_try_orders: Sequence[Sequence[str]],
+    cfg: PowerMonthlyConfig,
+) -> Tuple[Dict, Dict]:
+    """
+    Returns: (payload, debug_info)
+    Tries:
+      - different date formats (YYYY then YYYYMMDD)
+      - different parameter sets (e.g., [PRECTOTCORR, PRECTOT] then [PRECTOT])
+    """
+    last_err: Optional[Exception] = None
+    for date_fmt in cfg.date_formats:
+        for params in params_try_orders:
+            try:
+                payload = _power_request_json(
+                    lat=lat, lon=lon, start_year=start_year, end_year=end_year,
+                    params=params, cfg=cfg, date_fmt=date_fmt
+                )
+                dbg = {
+                    "ok": True,
+                    "date_fmt": date_fmt,
+                    "params": list(params),
+                    "url": POWER_MONTHLY_ENDPOINT,
+                }
+                return payload, dbg
+            except Exception as e:
+                last_err = e
+                continue
+
+    raise RuntimeError(f"All NASA POWER request attempts failed. Last error: {last_err}")
+
+
+def _extract_monthly_series(payload: Dict, param: str) -> pd.Series:
+    """
+    POWER monthly JSON typically:
+      payload["properties"]["parameter"][param] = { "201001": value, ... }
+
+    We only accept keys like YYYYMM with MM in 01..12.
+    """
     try:
-        v = float(x)
-        if math.isfinite(v):
-            return v
+        d = payload["properties"]["parameter"][param]
     except Exception:
-        pass
-    return float("nan")
+        return pd.Series(dtype=float)
+
+    vals = {}
+    for k, v in d.items():
+        ks = str(k)
+        if len(ks) != 6 or (not ks.isdigit()):
+            continue
+        y = int(ks[:4])
+        m = int(ks[4:6])
+        if m < 1 or m > 12:
+            continue
+        ts = pd.Timestamp(year=y, month=m, day=1)
+        try:
+            fv = float(v)
+        except Exception:
+            fv = np.nan
+        # POWER sometimes uses -999 for missing
+        if fv <= -900:
+            fv = np.nan
+        vals[ts] = fv
+
+    s = pd.Series(vals).sort_index()
+    s.index.name = "date"
+    return s
 
 
-def _extract_param_series(param_block: Dict) -> Dict[pd.Timestamp, float]:
+def _mm_day_to_mm_month(s_mm_day: pd.Series) -> pd.Series:
     """
-    POWER monthly point can come as:
-      - keys: "YYYYMM"
-      - or nested "YYYY" -> {"MM": value}
-    We normalize into {month_start: value}.
+    Convert a monthly series expressed as mm/day to mm/month by multiplying
+    by the number of days in each month. Returns a Series (never Index/array).
     """
-    out: Dict[pd.Timestamp, float] = {}
+    if s_mm_day is None or len(s_mm_day) == 0:
+        return pd.Series(dtype=float)
 
-    # Case 1: YYYYMM keys
-    keys = list(param_block.keys())
-    if any(isinstance(k, str) and k.isdigit() and len(k) == 6 for k in keys):
-        for k, v in param_block.items():
-            if not (isinstance(k, str) and k.isdigit() and len(k) == 6):
-                continue
-            y = int(k[:4])
-            m = int(k[4:6])
+    # Ensure datetime index (month starts)
+    idx = pd.to_datetime(s_mm_day.index, errors="coerce")
+    s = pd.Series(pd.to_numeric(s_mm_day.to_numpy(), errors="coerce"), index=idx).dropna()
+    if s.empty:
+        return pd.Series(dtype=float)
 
-            # NASA POWER sometimes includes "month 13" = annual aggregate (or other non-month keys).
-            # We only keep real months 1..12.
-            if not (1 <= m <= 12):
-                continue
+    # Days in month as numpy float array
+    dim = pd.DatetimeIndex(s.index).days_in_month.astype(float)
 
-            out[_month_start(y, m)] = _safe_float(v)
-        return out
+    out = s.to_numpy(dtype=float) * dim
+    out_s = pd.Series(out, index=pd.DatetimeIndex(s.index), name=s_mm_day.name)
+    out_s.index.name = "date"
+    return out_s
 
-    # Case 2: YYYY -> month dict
-    if any(isinstance(k, str) and k.isdigit() and len(k) == 4 for k in keys):
-        for yk, months in param_block.items():
-            if not (isinstance(yk, str) and yk.isdigit() and len(yk) == 4):
-                continue
-            if not isinstance(months, dict):
-                continue
-            y = int(yk)
-            for mk, v in months.items():
-                try:
-                    m = int(mk)
-                except Exception:
-                    continue
-                if 1 <= m <= 12:
-                    out[_month_start(y, m)] = _safe_float(v)
-        return out
-
-    # Unknown format -> empty
-    return out
-
-
-def _detect_units_from_response(payload: Dict) -> Dict[str, str]:
-    """
-    Try to find units in response metadata (if present). If not found, return {}.
-    """
-    units: Dict[str, str] = {}
-
-    # Some POWER responses include parameter information blocks; we try a few common shapes
-    props = payload.get("properties", {}) if isinstance(payload, dict) else {}
-    pinfo = props.get("parameter_information") or props.get("parameters") or {}
-
-    if isinstance(pinfo, dict):
-        # could be {"T2M": {"units": "C"}, ...}
-        for p, meta in pinfo.items():
-            if isinstance(meta, dict) and "units" in meta:
-                units[str(p)] = str(meta["units"])
-
-    return units
 
 
 def fetch_power_monthly(
@@ -114,95 +203,89 @@ def fetch_power_monthly(
     lon: float,
     start_year: int,
     end_year: int,
-    cfg: PowerMonthlyConfig = PowerMonthlyConfig(),
+    cfg: Optional[PowerMonthlyConfig] = None,
 ) -> pd.DataFrame:
-    """
-    Returns monthly dataframe with:
-      date, precip_mm_month_est, t2m_c, tmax_c, tmin_c, source
-    """
-    cache_dir = Path(cfg.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cfg = cfg or PowerMonthlyConfig()
+    cache_dir = _ensure_cache_dir(cfg)
 
-    rlat = round(float(lat), cfg.round_coords)
-    rlon = round(float(lon), cfg.round_coords)
-    key = f"power_monthly_{cfg.community}_{rlat}_{rlon}_{start_year}_{end_year}_{'-'.join(cfg.params)}.json"
-    cache_path = cache_dir / key
+    # ----- Cache (best-effort) -----
+    precip_key = _cache_key(lat, lon, start_year, end_year, cfg.precip_params, cfg.community)
+    temp_key = _cache_key(lat, lon, start_year, end_year, cfg.temp_params, cfg.community)
+    precip_cache = (cache_dir / f"power_monthly_precip_{precip_key}.json") if cache_dir else None
+    temp_cache = (cache_dir / f"power_monthly_temp_{temp_key}.json") if cache_dir else None
 
-    if cache_path.exists():
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    precip_payload = None
+    temp_payload = None
+    dbg_precip = {}
+    dbg_temp = {}
+
+    # Precip request fallbacks: try both params, then only PRECTOTCORR, then only PRECTOT
+    precip_orders = [
+        tuple(cfg.precip_params),
+        ("PRECTOTCORR",),
+        ("PRECTOT",),
+    ]
+
+    # Temp request fallbacks: full set, then progressively smaller
+    temp_orders = [
+        tuple(cfg.temp_params),
+        ("T2M", "T2M_MAX"),
+        ("T2M", "T2M_MIN"),
+        ("T2M",),
+    ]
+
+    if precip_cache and precip_cache.exists():
+        precip_payload = json.loads(precip_cache.read_text(encoding="utf-8"))
+        dbg_precip = {"ok": True, "cache": True, "path": str(precip_cache)}
     else:
-        params = {
-            "parameters": ",".join(cfg.params),
-            "community": cfg.community,
-            "longitude": str(lon),
-            "latitude": str(lat),
-            "start": str(start_year),
-            "end": str(end_year),
-            "format": "JSON",
-        }
-        resp = requests.get(POWER_MONTHLY_ENDPOINT, params=params, timeout=cfg.timeout_s)
-        resp.raise_for_status()
-        payload = resp.json()
-        cache_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    props = payload.get("properties", {})
-    param_block = props.get("parameter", {})
-
-    # Extract raw series
-    raw: Dict[str, Dict[pd.Timestamp, float]] = {}
-    for p in cfg.params:
-        block = param_block.get(p, {})
-        if isinstance(block, dict):
-            raw[p] = _extract_param_series(block)
-        else:
-            raw[p] = {}
-
-    # Union of all months
-    all_months = set()
-    for d in raw.values():
-        all_months |= set(d.keys())
-    months = sorted(all_months)
-
-    if not months:
-        return pd.DataFrame(columns=["date", "precip_mm_month_est", "t2m_c", "tmax_c", "tmin_c", "source"])
-
-    # Units detection (best-effort)
-    units = _detect_units_from_response(payload)
-    prectot_units = units.get("PRECTOT", "").lower()
-
-    rows = []
-    for dt in months:
-        prectot = raw.get("PRECTOT", {}).get(dt, float("nan"))
-        t2m = raw.get("T2M", {}).get(dt, float("nan"))
-        tmax = raw.get("T2M_MAX", {}).get(dt, float("nan"))
-        tmin = raw.get("T2M_MIN", {}).get(dt, float("nan"))
-
-        # Convert precipitation to mm/month (robust):
-        # - If units say mm/day -> multiply by days
-        # - If units say mm -> keep
-        # - If units missing -> heuristic: small values look like mm/day
-        dim = _days_in_month(dt)
-        if "mm/day" in prectot_units or "/day" in prectot_units:
-            precip_mm_month = prectot * dim
-        elif "mm" in prectot_units:
-            precip_mm_month = prectot
-        else:
-            # heuristic
-            if pd.notna(prectot) and 0.0 <= float(prectot) <= 25.0:
-                precip_mm_month = float(prectot) * dim
-            else:
-                precip_mm_month = float(prectot)
-
-        rows.append(
-            {
-                "date": dt,
-                "precip_mm_month_est": precip_mm_month,
-                "t2m_c": t2m,
-                "tmax_c": tmax,
-                "tmin_c": tmin,
-                "source": "NASA_POWER_MONTHLY",
-            }
+        precip_payload, dbg_precip = _try_power_request_with_fallbacks(
+            lat=lat, lon=lon, start_year=start_year, end_year=end_year,
+            params_try_orders=precip_orders, cfg=cfg
         )
+        if precip_cache:
+            precip_cache.write_text(json.dumps(precip_payload), encoding="utf-8")
 
-    out = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-    return out    
+    if temp_cache and temp_cache.exists():
+        temp_payload = json.loads(temp_cache.read_text(encoding="utf-8"))
+        dbg_temp = {"ok": True, "cache": True, "path": str(temp_cache)}
+    else:
+        temp_payload, dbg_temp = _try_power_request_with_fallbacks(
+            lat=lat, lon=lon, start_year=start_year, end_year=end_year,
+            params_try_orders=temp_orders, cfg=cfg
+        )
+        if temp_cache:
+            temp_cache.write_text(json.dumps(temp_payload), encoding="utf-8")
+
+    # ----- Extract series -----
+    # Precip: prefer PRECTOTCORR if present & non-null; else PRECTOT
+    s_pcorr = _extract_monthly_series(precip_payload, "PRECTOTCORR")
+    s_praw = _extract_monthly_series(precip_payload, "PRECTOT")
+
+    s_precip_base = s_pcorr if (not s_pcorr.dropna().empty) else s_praw
+    precip_mm_month_est = pd.Series(_mm_day_to_mm_month(s_precip_base), index=s_precip_base.index)
+
+    s_t2m = _extract_monthly_series(temp_payload, "T2M")
+    s_tmax = _extract_monthly_series(temp_payload, "T2M_MAX")
+    s_tmin = _extract_monthly_series(temp_payload, "T2M_MIN")
+
+    # Common index (union of all)
+    idx = precip_mm_month_est.index.union(s_t2m.index).union(s_tmax.index).union(s_tmin.index)
+    idx = idx.sort_values()
+
+    df = pd.DataFrame({"date": idx})
+    df["precip_mm_month_est"] = df["date"].map(precip_mm_month_est.to_dict())
+    df["t2m_c"] = df["date"].map(s_t2m.to_dict())
+    df["tmax_c"] = df["date"].map(s_tmax.to_dict())
+    df["tmin_c"] = df["date"].map(s_tmin.to_dict())
+
+    df["source"] = "NASA_POWER_MONTHLY"
+
+    # Debug columns are handy to diagnose future 422s (you can drop later)
+    df["debug_precip_request"] = json.dumps(dbg_precip, ensure_ascii=False)
+    df["debug_temp_request"] = json.dumps(dbg_temp, ensure_ascii=False)
+
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
+__all__ = ["PowerMonthlyConfig", "fetch_power_monthly"]
