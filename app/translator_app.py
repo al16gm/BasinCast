@@ -2183,40 +2183,82 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     mf["date"] = pd.to_datetime(mf["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     mf = mf.dropna(subset=["date"]).sort_values("date")
 
+    # -----------------------------
+    # ✅ FIX: ALWAYS show Planning vs Advisory vs Beyond segments
+    # -----------------------------
     last_obs_date = pd.to_datetime(g_obs_plot["date"].max(), errors="coerce")
     adv_h = int(advisory_h or 0)
     plan_h = int(planning_h or 0)
-    reliable_h = plan_h if plan_h > 0 else adv_h
 
-    cutoff_iso = None
-    if pd.notna(last_obs_date) and reliable_h > 0:
-        cutoff_iso = _x_iso(last_obs_date + pd.DateOffset(months=reliable_h))
+    plan_cut = None
+    adv_cut = None
+    if pd.notna(last_obs_date):
+        if plan_h > 0:
+            plan_cut = last_obs_date + pd.DateOffset(months=plan_h)
+        if adv_h > 0:
+            adv_cut = last_obs_date + pd.DateOffset(months=adv_h)
 
-    if cutoff_iso is not None:
-        cutoff_ts = pd.to_datetime(cutoff_iso)
-        mf_rel = mf[mf["date"] <= cutoff_ts].copy()
-        mf_bey = mf[mf["date"] > cutoff_ts].copy()
+    # If planning not defined but advisory is, treat planning == advisory (single reliable segment)
+    if plan_cut is None and adv_cut is not None:
+        plan_cut = adv_cut
 
-        if not mf_rel.empty:
-            fig.add_trace(go.Scatter(
-                x=mf_rel["date"], y=mf_rel["y_forecast"],
-                mode="lines", name=f"Forecast (reliable ≤ {reliable_h}m)"
-            ))
-        if not mf_bey.empty:
-            fig.add_trace(go.Scatter(
-                x=mf_bey["date"], y=mf_bey["y_forecast"],
-                mode="lines", name="Forecast (beyond reliable)",
-                line=dict(dash="dot")
-            ))
+    mf_seg = mf.copy()
+    mf_plan = mf_seg
+    mf_adv = mf_seg.iloc[0:0].copy()
+    mf_beyond = mf_seg.iloc[0:0].copy()
 
-        x0_iso = _x_iso(mf["date"].min())
-        x1_iso = _x_iso(mf["date"].max())
-        if x0_iso and x1_iso:
-            _add_vrect_safe(fig, x0_iso, cutoff_iso, 0.10, "Usable (reliable)")
-            _add_vrect_safe(fig, cutoff_iso, x1_iso, 0.05, "Beyond reliable")
-    else:
-        fig.add_trace(go.Scatter(x=mf["date"], y=mf["y_forecast"], mode="lines", name="Forecast (monthly)"))
+    if plan_cut is not None:
+        mf_plan = mf_seg[mf_seg["date"] <= plan_cut].copy()
+        mf_rest = mf_seg[mf_seg["date"] > plan_cut].copy()
 
+        if adv_cut is not None and adv_cut > plan_cut:
+            mf_adv = mf_rest[mf_rest["date"] <= adv_cut].copy()
+            mf_beyond = mf_rest[mf_rest["date"] > adv_cut].copy()
+        else:
+            mf_beyond = mf_rest.copy()
+
+    # Plot segments
+    if not mf_plan.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_plan["date"], y=mf_plan["y_forecast"],
+            mode="lines",
+            name=(f"Forecast (planning ≤ {plan_h}m)" if plan_h > 0 else "Forecast (reliable)")
+        ))
+    if not mf_adv.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_adv["date"], y=mf_adv["y_forecast"],
+            mode="lines",
+            name=f"Forecast (advisory ≤ {adv_h}m)",
+            line=dict(dash="dash")
+        ))
+    if not mf_beyond.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_beyond["date"], y=mf_beyond["y_forecast"],
+            mode="lines",
+            name="Forecast (beyond advisory)",
+            line=dict(dash="dot")
+        ))
+
+    # Shading (paper-friendly)
+    x0_iso = _x_iso(mf_seg["date"].min())
+    x1_iso = _x_iso(mf_seg["date"].max())
+    if x0_iso and x1_iso and pd.notna(last_obs_date):
+        if plan_cut is not None:
+            plan_iso = _x_iso(plan_cut)
+            if plan_iso:
+                _add_vrect_safe(fig, x0_iso, plan_iso, 0.10, "Planning (more reliable)")
+                if adv_cut is not None and adv_cut > plan_cut:
+                    adv_iso = _x_iso(adv_cut)
+                    if adv_iso:
+                        _add_vrect_safe(fig, plan_iso, adv_iso, 0.06, "Advisory (less reliable)")
+                        _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
+                else:
+                    _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond planning")
+        else:
+            # No horizons available -> no shading
+            pass
+
+    # Scenarios lines
     if scen is not None and (not scen.empty):
         scen_plot = scen.copy()
         scen_plot["date"] = pd.to_datetime(scen_plot["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
@@ -2224,14 +2266,15 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_favorable"], mode="lines", name="Scenario favorable"))
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_unfavorable"], mode="lines", name="Scenario unfavorable"))
 
+    # Horizon verticals (keep)
     if pd.notna(last_obs_date) and adv_h > 0:
         adv_iso = _x_iso(last_obs_date + pd.DateOffset(months=adv_h))
         if adv_iso:
             _add_vline_safe(fig, adv_iso, f"Advisory horizon ({adv_h}m)")
     if pd.notna(last_obs_date) and plan_h > 0:
-        plan_iso = _x_iso(last_obs_date + pd.DateOffset(months=plan_h))
-        if plan_iso:
-            _add_vline_safe(fig, plan_iso, f"Planning horizon ({plan_h}m)")
+        plan_iso2 = _x_iso(last_obs_date + pd.DateOffset(months=plan_h))
+        if plan_iso2:
+            _add_vline_safe(fig, plan_iso2, f"Planning horizon ({plan_h}m)")
 
     fig.update_layout(
         height=420,
@@ -2254,6 +2297,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             gg = gk[gk["family"].astype(str) == fam]
             fig2.add_trace(go.Scatter(x=gg["horizon"], y=gg["kge"], mode="lines+markers", name=str(fam)))
 
+        # thresholds (keep 0.6 / 0.3)
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
                        y0=0.60, y1=0.60, xref="x", yref="y", line=dict(width=1, dash="dash"))
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
