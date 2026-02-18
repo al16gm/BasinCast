@@ -1806,6 +1806,10 @@ st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast
 
 import json
 import hashlib
+import os
+import sys
+import subprocess
+from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
@@ -1856,7 +1860,6 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 def _try_git_commit_hash() -> str:
     try:
-        import subprocess
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
@@ -2006,9 +2009,8 @@ if run_btn:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
 
             st.caption(f"Manifest saved: {manifest_path}")
-
-            # Include manifest in displayed paths
             out["paths"]["manifest"] = str(manifest_path)
+
         except Exception as e:
             st.warning(f"Manifest could not be written (safe): {e}")
 
@@ -2020,7 +2022,6 @@ if run_btn:
         st.session_state["core_paths"] = out["paths"]
         st.session_state["last_run_outdir"] = str(run_outdir)
 
-        # After a run, auto-generate a fresh run id for the NEXT run (prevents overwriting)
         st.session_state["pending_run_id"] = _make_run_id()
 
         st.success(tr(
@@ -2153,13 +2154,14 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         )
 
     def _add_vrect_safe(_fig, _x0_iso: str, _x1_iso: str, _opacity: float, _label: str):
+        # IMPORTANT: use a light overlay so it is visible on dark themes
         _fig.add_shape(
             type="rect",
             x0=_x0_iso, x1=_x1_iso,
             y0=0, y1=1,
             xref="x", yref="paper",
             line=dict(width=0),
-            fillcolor="rgba(0,0,0,1)",
+            fillcolor="rgba(255,255,255,1)",
             opacity=float(_opacity),
             layer="below",
         )
@@ -2184,11 +2186,14 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     mf = mf.dropna(subset=["date"]).sort_values("date")
 
     # -----------------------------
-    # ✅ FIX: ALWAYS show Planning vs Advisory vs Beyond segments
+    # ✅ FIX: reliable vs beyond (and planning vs advisory if both exist)
     # -----------------------------
     last_obs_date = pd.to_datetime(g_obs_plot["date"].max(), errors="coerce")
     adv_h = int(advisory_h or 0)
     plan_h = int(planning_h or 0)
+
+    forecast_start = pd.to_datetime(mf["date"].min(), errors="coerce")
+    forecast_end = pd.to_datetime(mf["date"].max(), errors="coerce")
 
     plan_cut = None
     adv_cut = None
@@ -2198,9 +2203,9 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         if adv_h > 0:
             adv_cut = last_obs_date + pd.DateOffset(months=adv_h)
 
-    # If planning not defined but advisory is, treat planning == advisory (single reliable segment)
+    # If no planning but advisory exists -> treat advisory as the "reliable" horizon
     if plan_cut is None and adv_cut is not None:
-        plan_cut = adv_cut
+        plan_cut = adv_cut  # single reliable segment
 
     mf_seg = mf.copy()
     mf_plan = mf_seg
@@ -2211,52 +2216,99 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         mf_plan = mf_seg[mf_seg["date"] <= plan_cut].copy()
         mf_rest = mf_seg[mf_seg["date"] > plan_cut].copy()
 
-        if adv_cut is not None and adv_cut > plan_cut:
+        # Only create an "advisory middle band" when planning exists AND advisory is strictly longer
+        if (planning_h > 0) and (adv_cut is not None) and (adv_cut > plan_cut):
             mf_adv = mf_rest[mf_rest["date"] <= adv_cut].copy()
             mf_beyond = mf_rest[mf_rest["date"] > adv_cut].copy()
         else:
             mf_beyond = mf_rest.copy()
 
     # Plot segments
-    if not mf_plan.empty:
-        fig.add_trace(go.Scatter(
-            x=mf_plan["date"], y=mf_plan["y_forecast"],
-            mode="lines",
-            name=(f"Forecast (planning ≤ {plan_h}m)" if plan_h > 0 else "Forecast (reliable)")
-        ))
-    if not mf_adv.empty:
-        fig.add_trace(go.Scatter(
-            x=mf_adv["date"], y=mf_adv["y_forecast"],
-            mode="lines",
-            name=f"Forecast (advisory ≤ {adv_h}m)",
-            line=dict(dash="dash")
-        ))
-    if not mf_beyond.empty:
-        fig.add_trace(go.Scatter(
-            x=mf_beyond["date"], y=mf_beyond["y_forecast"],
-            mode="lines",
-            name="Forecast (beyond advisory)",
-            line=dict(dash="dot")
-        ))
+    if plan_cut is None:
+        fig.add_trace(go.Scatter(x=mf_seg["date"], y=mf_seg["y_forecast"], mode="lines", name="Forecast (monthly)"))
+    else:
+        # planning_h>0 => "planning", otherwise this is "reliable ≤ advisory"
+        if not mf_plan.empty:
+            if plan_h > 0:
+                name_plan = f"Forecast (planning ≤ {plan_h}m)"
+            else:
+                name_plan = f"Forecast (reliable ≤ {adv_h}m)" if adv_h > 0 else "Forecast (reliable)"
+            fig.add_trace(go.Scatter(
+                x=mf_plan["date"], y=mf_plan["y_forecast"],
+                mode="lines",
+                name=name_plan
+            ))
 
-    # Shading (paper-friendly)
-    x0_iso = _x_iso(mf_seg["date"].min())
-    x1_iso = _x_iso(mf_seg["date"].max())
-    if x0_iso and x1_iso and pd.notna(last_obs_date):
-        if plan_cut is not None:
-            plan_iso = _x_iso(plan_cut)
-            if plan_iso:
-                _add_vrect_safe(fig, x0_iso, plan_iso, 0.10, "Planning (more reliable)")
-                if adv_cut is not None and adv_cut > plan_cut:
-                    adv_iso = _x_iso(adv_cut)
-                    if adv_iso:
-                        _add_vrect_safe(fig, plan_iso, adv_iso, 0.06, "Advisory (less reliable)")
-                        _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
-                else:
+        if not mf_adv.empty:
+            fig.add_trace(go.Scatter(
+                x=mf_adv["date"], y=mf_adv["y_forecast"],
+                mode="lines",
+                name=f"Forecast (advisory ≤ {adv_h}m)",
+                line=dict(dash="dash")
+            ))
+
+        if not mf_beyond.empty:
+            # label depends on whether this is beyond planning or beyond advisory
+            if (plan_h > 0) and (adv_h > plan_h):
+                beyond_name = "Forecast (beyond advisory)"
+            else:
+                beyond_name = "Forecast (beyond reliable)"
+            fig.add_trace(go.Scatter(
+                x=mf_beyond["date"], y=mf_beyond["y_forecast"],
+                mode="lines",
+                name=beyond_name,
+                line=dict(dash="dot")
+            ))
+
+        # If there is no beyond segment, explain it (this is your “why did the split disappear?”)
+        if pd.notna(forecast_end) and (mf_beyond.empty):
+            if (adv_cut is not None) and (pd.to_datetime(adv_cut) >= forecast_end):
+                st.info(tr(
+                    "Toda la predicción cae dentro del horizonte fiable (no existe tramo 'beyond').",
+                    "All forecast months are within the reliable horizon (no 'beyond' segment exists).",
+                    LANG
+                ))
+            elif (plan_cut is not None) and (pd.to_datetime(plan_cut) >= forecast_end):
+                st.info(tr(
+                    "Toda la predicción cae dentro del horizonte de planificación (no existe tramo posterior).",
+                    "All forecast months are within the planning horizon (no later segment exists).",
+                    LANG
+                ))
+
+    # Shading (visible in dark theme)
+    x0_iso = _x_iso(forecast_start)
+    x1_iso = _x_iso(forecast_end)
+
+    if x0_iso and x1_iso and (plan_cut is not None) and pd.notna(last_obs_date):
+        # clamp cuts to forecast_end for clean rectangles
+        def _clamp_cut(cut_ts: Optional[pd.Timestamp]) -> Optional[str]:
+            if cut_ts is None:
+                return None
+            c = pd.to_datetime(cut_ts, errors="coerce")
+            if pd.isna(c) or pd.isna(forecast_end):
+                return None
+            c = min(c, forecast_end)
+            return _x_iso(c)
+
+        plan_iso = _clamp_cut(plan_cut)
+        adv_iso = _clamp_cut(adv_cut) if (adv_cut is not None) else None
+
+        if plan_h > 0:
+            if plan_iso and plan_iso != x0_iso:
+                _add_vrect_safe(fig, x0_iso, plan_iso, 0.08, "Planning (more reliable)")
+            if (adv_h > plan_h) and adv_iso and plan_iso and (adv_iso != plan_iso):
+                _add_vrect_safe(fig, plan_iso, adv_iso, 0.05, "Advisory (less reliable)")
+                if adv_iso != x1_iso:
+                    _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
+            else:
+                if plan_iso and plan_iso != x1_iso:
                     _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond planning")
         else:
-            # No horizons available -> no shading
-            pass
+            # planning_h==0 => reliable is advisory horizon
+            if plan_iso and plan_iso != x0_iso:
+                _add_vrect_safe(fig, x0_iso, plan_iso, 0.06, "Reliable")
+            if plan_iso and plan_iso != x1_iso:
+                _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond reliable")
 
     # Scenarios lines
     if scen is not None and (not scen.empty):
@@ -2268,9 +2320,9 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
 
     # Horizon verticals (keep)
     if pd.notna(last_obs_date) and adv_h > 0:
-        adv_iso = _x_iso(last_obs_date + pd.DateOffset(months=adv_h))
-        if adv_iso:
-            _add_vline_safe(fig, adv_iso, f"Advisory horizon ({adv_h}m)")
+        adv_iso2 = _x_iso(last_obs_date + pd.DateOffset(months=adv_h))
+        if adv_iso2:
+            _add_vline_safe(fig, adv_iso2, f"Advisory horizon ({adv_h}m)")
     if pd.notna(last_obs_date) and plan_h > 0:
         plan_iso2 = _x_iso(last_obs_date + pd.DateOffset(months=plan_h))
         if plan_iso2:
