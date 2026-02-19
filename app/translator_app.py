@@ -1800,7 +1800,7 @@ if cwd is not None:
 
 
 # -----------------------------
-# 10) Run BasinCast + Visualize
+# 10) Run BasinCast + Visualize (v0.14)  [v0.15 UX patch]
 # -----------------------------
 st.markdown("---")
 st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast Core + Visualize (v0.14)", LANG))
@@ -1808,11 +1808,12 @@ st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast
 import json
 import hashlib
 import os
+import re
 import sys
 import subprocess
 import time
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 # Prefer canonical_with_meteo_and_demand > canonical_with_meteo > canonical_df
@@ -1862,6 +1863,7 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 def _try_git_commit_hash() -> str:
     try:
+        import subprocess
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
@@ -1889,7 +1891,21 @@ def _resolve_core_outputs(outdir: Path) -> tuple[Path, Path, Path]:
         raise RuntimeError(f"Core did not create expected outputs in {outdir}")
     return m, s, f
 
-def _run_core_cli(df_input: pd.DataFrame, outdir: Path, holdout_months: int, inner_val_months: int) -> dict:
+def _run_core_cli(
+    df_input: pd.DataFrame,
+    outdir: Path,
+    holdout_months: int,
+    inner_val_months: int,
+    progress_bar=None,
+    status_box=None,
+    log_tail_box=None,
+) -> dict:
+    """
+    Runs the core CLI and streams logs to support a real progress bar.
+
+    Progress protocol (core side):
+      print(f"PROGRESS {i}/{n} point_id={pid}", flush=True)
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     tmp_inp = outdir / "_tmp_canonical_for_core.csv"
     df_input.to_csv(tmp_inp, index=False)
@@ -1915,12 +1931,70 @@ def _run_core_cli(df_input: pd.DataFrame, outdir: Path, holdout_months: int, inn
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
-    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    stdout = res.stdout or ""
-    stderr = res.stderr or ""
+    # Stream stdout+stderr together (avoids deadlocks and lets us parse progress)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        bufsize=1,
+        universal_newlines=True,
+    )
 
-    if res.returncode != 0:
-        raise RuntimeError(f"Core failed (returncode={res.returncode}). STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
+    stdout_lines = []
+    last_i = 0
+    last_n = 0
+    nonprog_counter = 0
+
+    if status_box is not None:
+        status_box.caption(tr("Ejecutando core... (puede tardar varios minutos)", "Running core... (may take a few minutes)", LANG))
+
+    prog_re = re.compile(r"^PROGRESS\s+(\d+)\s*/\s*(\d+)\s*(.*)$")
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stdout_lines.append(line)
+        s = (line or "").strip()
+
+        mm = prog_re.match(s)
+        if mm:
+            i = int(mm.group(1))
+            n = int(mm.group(2))
+            extra = (mm.group(3) or "").strip()
+            last_i, last_n = i, n
+
+            if progress_bar is not None and n > 0:
+                progress_bar.progress(min(100, max(0, int(round(100 * i / n)))))
+
+            if status_box is not None:
+                label = f"{i}/{n}"
+                if extra:
+                    label += f" — {extra}"
+                status_box.caption(tr(f"Procesando puntos: {label}", f"Processing points: {label}", LANG))
+
+        else:
+            nonprog_counter += 1
+            if log_tail_box is not None and (nonprog_counter % 30 == 0):
+                tail = "".join(stdout_lines[-30:])
+                log_tail_box.code(tail[-6000:])
+
+    proc.wait()
+
+    stdout = "".join(stdout_lines)
+    stderr = ""  # merged into stdout
+
+    if proc.returncode != 0:
+        tail = "".join(stdout_lines[-120:])
+        raise RuntimeError(
+            f"Core failed (returncode={proc.returncode}).\n\nTAIL (last ~120 lines):\n{tail}"
+        )
+
+    if progress_bar is not None:
+        progress_bar.progress(100)
+
+    if status_box is not None and last_n > 0:
+        status_box.caption(tr("Core finalizado. Cargando outputs...", "Core finished. Loading outputs...", LANG))
 
     metrics_path, skill_path, forecasts_path = _resolve_core_outputs(outdir)
     metrics_df = pd.read_csv(metrics_path)
@@ -1960,6 +2034,7 @@ with c3:
         value=str(default_root),
     ))
 
+    # pending run id (so you see the folder BEFORE running)
     if "pending_run_id" not in st.session_state:
         st.session_state["pending_run_id"] = _make_run_id()
 
@@ -1970,17 +2045,44 @@ with c3:
     run_outdir = run_root / st.session_state["pending_run_id"]
     st.caption(f"Next run folder: {run_outdir}")
 
+# -----------------------------
+# v0.15: Run scope (single point vs all points)
+# -----------------------------
+run_scope = st.radio(
+    tr("¿Qué puntos quieres evaluar?", "Which points do you want to run?", LANG),
+    [tr("Todos los puntos", "All points", LANG), tr("Solo un punto (más rápido)", "Single point only (faster)", LANG)],
+    index=0,
+    key="run_scope_v015",
+)
+
+run_pid = None
+if run_scope == tr("Solo un punto (más rápido)", "Single point only (faster)", LANG):
+    _pids = sorted(df_run["point_id"].astype(str).unique().tolist())
+    run_pid = st.selectbox(tr("Punto a ejecutar", "Point to run", LANG), _pids, index=0, key="run_pid_v015")
+
 run_btn = st.button(tr("▶ Ejecutar BasinCast Core", "▶ Run BasinCast Core", LANG), type="primary")
 
 if run_btn:
     try:
-        with st.spinner(tr("Ejecutando BasinCast Core...", "Running BasinCast Core...", LANG)):
-            progress_bar = st.progress(0)
-            out = _run_core_cli(df_run, run_outdir, holdout_months, inner_val_months)
+        # Resolve run scope
+        df_to_run = df_run.copy()
+        if run_pid is not None:
+            df_to_run = df_run[df_run["point_id"].astype(str) == str(run_pid)].copy()
 
-            for i in range(0, 101, 10):
-                progress_bar.progress(i)
-                time.sleep(1)
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+        log_tail_box = st.empty()
+
+        out = _run_core_cli(
+            df_to_run,
+            run_outdir,
+            holdout_months,
+            inner_val_months,
+            progress_bar=progress_bar,
+            status_box=status_box,
+            log_tail_box=log_tail_box,
+        )
+        log_tail_box.empty()
 
         # ---- Write manifest.json (paper-friendly reproducibility) ----
         try:
@@ -2002,6 +2104,8 @@ if run_btn:
                     "canonical_csv": str(tmp_inp),
                     "canonical_sha256": canonical_sha256,
                     "run_mode": str(run_mode),
+                    "run_scope": ("SINGLE_POINT" if run_pid is not None else "ALL_POINTS"),
+                    "run_point_id": (str(run_pid) if run_pid is not None else None),
                 },
                 "provenance": {
                     "meteo": meteo_info,
@@ -2015,11 +2119,13 @@ if run_btn:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
 
             st.caption(f"Manifest saved: {manifest_path}")
+
+            # Include manifest in displayed paths
             out["paths"]["manifest"] = str(manifest_path)
         except Exception as e:
             st.warning(f"Manifest could not be written (safe): {e}")
 
-        # ✅ CRITICAL: persist outputs for visualization
+        # Persist outputs in session state (this is what unlocks the plots below)
         st.session_state["core_stdout"] = out["stdout"]
         st.session_state["core_stderr"] = out["stderr"]
         st.session_state["core_metrics"] = out["metrics"]
@@ -2028,6 +2134,7 @@ if run_btn:
         st.session_state["core_paths"] = out["paths"]
         st.session_state["last_run_outdir"] = str(run_outdir)
 
+        # After a run, auto-generate a fresh run id for the NEXT run (prevents overwriting)
         st.session_state["pending_run_id"] = _make_run_id()
 
         st.success(tr(
@@ -2108,6 +2215,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     monthly_fc["horizon"] = pd.to_numeric(monthly_fc["horizon"], errors="coerce").astype(int)
     monthly_fc = monthly_fc.dropna(subset=["date", "horizon", "y_forecast"]).sort_values("date")
 
+    # Paper-friendly tables
     st.subheader(tr("📋 Tablas paper-friendly (por qué gana un modelo)", "📋 Paper-friendly tables (why a model wins)", LANG))
     leaderboard = _paper_leaderboard_from_skill(g_sk, horizons_focus=(1, 12))
     if leaderboard.empty:
@@ -2125,11 +2233,13 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             else:
                 st.dataframe(g_sk, use_container_width=True)
 
+    # Scenarios
     st.subheader(tr("🌦️ Escenarios climáticos (bandas simples)", "🌦️ Climate scenarios (simple bands)", LANG))
     fav_pct = st.slider(tr("% favorable", "% favorable", LANG), min_value=0, max_value=30, value=5, step=1) / 100.0
     unf_pct = st.slider(tr("% unfavorable", "% unfavorable", LANG), min_value=0, max_value=30, value=5, step=1) / 100.0
     scen = _paper_scenario_bands(monthly_fc, favorable_pct=fav_pct, unfavorable_pct=unf_pct)
 
+    # ---- Monthly plot (ONLY ONCE) ----
     st.subheader(tr("📉 Serie temporal + predicción (mensual)", "📉 Time series + forecasts (monthly)", LANG))
 
     def _x_iso(x) -> Optional[str]:
@@ -2202,6 +2312,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         if adv_h > 0:
             adv_cut = last_obs_date + pd.DateOffset(months=adv_h)
 
+    # If planning not defined but advisory is, treat planning == advisory (single reliable segment)
     if plan_cut is None and adv_cut is not None:
         plan_cut = adv_cut
 
@@ -2220,6 +2331,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         else:
             mf_beyond = mf_rest.copy()
 
+    # Plot segments
     if not mf_plan.empty:
         fig.add_trace(go.Scatter(
             x=mf_plan["date"], y=mf_plan["y_forecast"],
@@ -2241,6 +2353,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             line=dict(dash="dot")
         ))
 
+    # Shading (paper-friendly)
     x0_iso = _x_iso(mf_seg["date"].min())
     x1_iso = _x_iso(mf_seg["date"].max())
     if x0_iso and x1_iso and pd.notna(last_obs_date):
@@ -2255,7 +2368,11 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                         _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
                 else:
                     _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond planning")
+        else:
+            # No horizons available -> no shading
+            pass
 
+    # Scenarios lines
     if scen is not None and (not scen.empty):
         scen_plot = scen.copy()
         scen_plot["date"] = pd.to_datetime(scen_plot["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
@@ -2263,6 +2380,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_favorable"], mode="lines", name="Scenario favorable"))
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_unfavorable"], mode="lines", name="Scenario unfavorable"))
 
+    # Horizon verticals (keep)
     if pd.notna(last_obs_date) and adv_h > 0:
         adv_iso = _x_iso(last_obs_date + pd.DateOffset(months=adv_h))
         if adv_iso:
@@ -2280,6 +2398,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     )
     st.plotly_chart(fig, use_container_width=True)
 
+    # Skill curve (SECOND FIGURE)
     st.subheader(tr("📊 Skill (KGE) vs horizonte", "📊 Skill (KGE) vs horizon", LANG))
     if (not g_sk.empty) and {"horizon", "kge", "family"}.issubset(set(g_sk.columns)):
         gk = g_sk.copy()
@@ -2292,6 +2411,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             gg = gk[gk["family"].astype(str) == fam]
             fig2.add_trace(go.Scatter(x=gg["horizon"], y=gg["kge"], mode="lines+markers", name=str(fam)))
 
+        # thresholds (keep 0.6 / 0.3)
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
                        y0=0.60, y1=0.60, xref="x", yref="y", line=dict(width=1, dash="dash"))
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
@@ -2311,6 +2431,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             LANG
         ))
 
+    # Downloads
     st.subheader(tr("📥 Descargas (outputs)", "📥 Downloads (outputs)", LANG))
     d1, d2, d3, d4 = st.columns(4)
     with d1:
