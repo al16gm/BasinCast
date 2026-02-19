@@ -1802,16 +1802,22 @@ if cwd is not None:
 # 10) Run BasinCast + Visualize
 # -----------------------------
 st.markdown("---")
-st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast Core + Visualize (v0.14)", LANG))
+st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.15)", "📈 Run BasinCast Core + Visualize (v0.15)", LANG))
 
-import json
-import hashlib
 import os
 import sys
+import json
+import hashlib
 import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+import plotly.graph_objects as go
+
+# ---- Thresholds (keep 0.6 / 0.3) ----
+KGE_PLANNING_THR = 0.60
+KGE_ADVISORY_THR = 0.30
 
 # Prefer canonical_with_meteo_and_demand > canonical_with_meteo > canonical_df
 df_run = None
@@ -1958,11 +1964,10 @@ with c3:
         value=str(default_root),
     ))
 
-    # pending run id (so you see the folder BEFORE running)
     if "pending_run_id" not in st.session_state:
         st.session_state["pending_run_id"] = _make_run_id()
 
-    regen = st.button(tr("🔄 Nuevo run folder", "🔄 New run folder", LANG), key="regen_run_id_v014")
+    regen = st.button(tr("🔄 Nuevo run folder", "🔄 New run folder", LANG), key="regen_run_id_v015")
     if regen:
         st.session_state["pending_run_id"] = _make_run_id()
 
@@ -1991,6 +1996,8 @@ if run_btn:
                 "core": {
                     "holdout_months": int(holdout_months),
                     "inner_val_months": int(inner_val_months),
+                    "kge_planning_thr": float(KGE_PLANNING_THR),
+                    "kge_advisory_thr": float(KGE_ADVISORY_THR),
                 },
                 "inputs": {
                     "canonical_csv": str(tmp_inp),
@@ -2010,7 +2017,6 @@ if run_btn:
 
             st.caption(f"Manifest saved: {manifest_path}")
             out["paths"]["manifest"] = str(manifest_path)
-
         except Exception as e:
             st.warning(f"Manifest could not be written (safe): {e}")
 
@@ -2113,7 +2119,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         ))
     else:
         st.dataframe(leaderboard, use_container_width=True)
-        st.caption(_paper_mini_analysis(leaderboard, planning_thr=0.60, advisory_thr=0.30))
+        st.caption(_paper_mini_analysis(leaderboard, planning_thr=KGE_PLANNING_THR, advisory_thr=KGE_ADVISORY_THR))
         with st.expander(tr("Ver skill detallado (transparencia)", "Show detailed skill table (transparency)", LANG)):
             if {"family", "horizon"}.issubset(set(g_sk.columns)):
                 st.dataframe(g_sk.sort_values(["family", "horizon"]), use_container_width=True)
@@ -2126,7 +2132,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     unf_pct = st.slider(tr("% unfavorable", "% unfavorable", LANG), min_value=0, max_value=30, value=5, step=1) / 100.0
     scen = _paper_scenario_bands(monthly_fc, favorable_pct=fav_pct, unfavorable_pct=unf_pct)
 
-    # ---- Monthly plot (ONLY ONCE) ----
+    # ---- Monthly plot ----
     st.subheader(tr("📉 Serie temporal + predicción (mensual)", "📉 Time series + forecasts (monthly)", LANG))
 
     def _x_iso(x) -> Optional[str]:
@@ -2154,14 +2160,13 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         )
 
     def _add_vrect_safe(_fig, _x0_iso: str, _x1_iso: str, _opacity: float, _label: str):
-        # IMPORTANT: use a light overlay so it is visible on dark themes
         _fig.add_shape(
             type="rect",
             x0=_x0_iso, x1=_x1_iso,
             y0=0, y1=1,
             xref="x", yref="paper",
             line=dict(width=0),
-            fillcolor="rgba(255,255,255,1)",
+            fillcolor="rgba(0,0,0,1)",
             opacity=float(_opacity),
             layer="below",
         )
@@ -2186,14 +2191,12 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     mf = mf.dropna(subset=["date"]).sort_values("date")
 
     # -----------------------------
-    # ✅ FIX: reliable vs beyond (and planning vs advisory if both exist)
+    # ✅ v0.15 FIX: Planning / Advisory / Beyond (NO “advisory-as-planning”)
     # -----------------------------
     last_obs_date = pd.to_datetime(g_obs_plot["date"].max(), errors="coerce")
+
     adv_h = int(advisory_h or 0)
     plan_h = int(planning_h or 0)
-
-    forecast_start = pd.to_datetime(mf["date"].min(), errors="coerce")
-    forecast_end = pd.to_datetime(mf["date"].max(), errors="coerce")
 
     plan_cut = None
     adv_cut = None
@@ -2203,112 +2206,73 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         if adv_h > 0:
             adv_cut = last_obs_date + pd.DateOffset(months=adv_h)
 
-    # If no planning but advisory exists -> treat advisory as the "reliable" horizon
-    if plan_cut is None and adv_cut is not None:
-        plan_cut = adv_cut  # single reliable segment
+    # Guard: if someone outputs adv <= plan, treat advisory as none (keeps segmentation sane)
+    if (plan_cut is not None) and (adv_cut is not None) and (adv_cut <= plan_cut):
+        adv_cut = None
 
-    mf_seg = mf.copy()
-    mf_plan = mf_seg
-    mf_adv = mf_seg.iloc[0:0].copy()
-    mf_beyond = mf_seg.iloc[0:0].copy()
+    # Segment masks
+    mf_plan = mf.iloc[0:0].copy()
+    mf_adv = mf.iloc[0:0].copy()
+    mf_beyond = mf.iloc[0:0].copy()
 
     if plan_cut is not None:
-        mf_plan = mf_seg[mf_seg["date"] <= plan_cut].copy()
-        mf_rest = mf_seg[mf_seg["date"] > plan_cut].copy()
-
-        # Only create an "advisory middle band" when planning exists AND advisory is strictly longer
-        if (planning_h > 0) and (adv_cut is not None) and (adv_cut > plan_cut):
-            mf_adv = mf_rest[mf_rest["date"] <= adv_cut].copy()
-            mf_beyond = mf_rest[mf_rest["date"] > adv_cut].copy()
+        mf_plan = mf[mf["date"] <= plan_cut].copy()
+        rest = mf[mf["date"] > plan_cut].copy()
+        if adv_cut is not None:
+            mf_adv = rest[rest["date"] <= adv_cut].copy()
+            mf_beyond = rest[rest["date"] > adv_cut].copy()
         else:
-            mf_beyond = mf_rest.copy()
-
-    # Plot segments
-    if plan_cut is None:
-        fig.add_trace(go.Scatter(x=mf_seg["date"], y=mf_seg["y_forecast"], mode="lines", name="Forecast (monthly)"))
+            mf_beyond = rest.copy()
+    elif adv_cut is not None:
+        # Advisory-only case (this is your current situation)
+        mf_adv = mf[mf["date"] <= adv_cut].copy()
+        mf_beyond = mf[mf["date"] > adv_cut].copy()
     else:
-        # planning_h>0 => "planning", otherwise this is "reliable ≤ advisory"
-        if not mf_plan.empty:
-            if plan_h > 0:
-                name_plan = f"Forecast (planning ≤ {plan_h}m)"
-            else:
-                name_plan = f"Forecast (reliable ≤ {adv_h}m)" if adv_h > 0 else "Forecast (reliable)"
-            fig.add_trace(go.Scatter(
-                x=mf_plan["date"], y=mf_plan["y_forecast"],
-                mode="lines",
-                name=name_plan
-            ))
+        # No horizons provided -> all as one line
+        pass
 
-        if not mf_adv.empty:
-            fig.add_trace(go.Scatter(
-                x=mf_adv["date"], y=mf_adv["y_forecast"],
-                mode="lines",
-                name=f"Forecast (advisory ≤ {adv_h}m)",
-                line=dict(dash="dash")
-            ))
+    # Plot segments (style communicates reliability even if only advisory exists)
+    if not mf_plan.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_plan["date"], y=mf_plan["y_forecast"],
+            mode="lines",
+            name=f"Forecast (planning ≤ {plan_h}m, KGE ≥ {KGE_PLANNING_THR:.2f})"
+        ))
+    if not mf_adv.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_adv["date"], y=mf_adv["y_forecast"],
+            mode="lines",
+            name=f"Forecast (advisory ≤ {adv_h}m, KGE ≥ {KGE_ADVISORY_THR:.2f})",
+            line=dict(dash="dash")
+        ))
+    if not mf_beyond.empty:
+        fig.add_trace(go.Scatter(
+            x=mf_beyond["date"], y=mf_beyond["y_forecast"],
+            mode="lines",
+            name="Forecast (beyond reliable)",
+            line=dict(dash="dot")
+        ))
 
-        if not mf_beyond.empty:
-            # label depends on whether this is beyond planning or beyond advisory
-            if (plan_h > 0) and (adv_h > plan_h):
-                beyond_name = "Forecast (beyond advisory)"
-            else:
-                beyond_name = "Forecast (beyond reliable)"
-            fig.add_trace(go.Scatter(
-                x=mf_beyond["date"], y=mf_beyond["y_forecast"],
-                mode="lines",
-                name=beyond_name,
-                line=dict(dash="dot")
-            ))
-
-        # If there is no beyond segment, explain it (this is your “why did the split disappear?”)
-        if pd.notna(forecast_end) and (mf_beyond.empty):
-            if (adv_cut is not None) and (pd.to_datetime(adv_cut) >= forecast_end):
-                st.info(tr(
-                    "Toda la predicción cae dentro del horizonte fiable (no existe tramo 'beyond').",
-                    "All forecast months are within the reliable horizon (no 'beyond' segment exists).",
-                    LANG
-                ))
-            elif (plan_cut is not None) and (pd.to_datetime(plan_cut) >= forecast_end):
-                st.info(tr(
-                    "Toda la predicción cae dentro del horizonte de planificación (no existe tramo posterior).",
-                    "All forecast months are within the planning horizon (no later segment exists).",
-                    LANG
-                ))
-
-    # Shading (visible in dark theme)
-    x0_iso = _x_iso(forecast_start)
-    x1_iso = _x_iso(forecast_end)
-
-    if x0_iso and x1_iso and (plan_cut is not None) and pd.notna(last_obs_date):
-        # clamp cuts to forecast_end for clean rectangles
-        def _clamp_cut(cut_ts: Optional[pd.Timestamp]) -> Optional[str]:
-            if cut_ts is None:
-                return None
-            c = pd.to_datetime(cut_ts, errors="coerce")
-            if pd.isna(c) or pd.isna(forecast_end):
-                return None
-            c = min(c, forecast_end)
-            return _x_iso(c)
-
-        plan_iso = _clamp_cut(plan_cut)
-        adv_iso = _clamp_cut(adv_cut) if (adv_cut is not None) else None
-
-        if plan_h > 0:
-            if plan_iso and plan_iso != x0_iso:
-                _add_vrect_safe(fig, x0_iso, plan_iso, 0.08, "Planning (more reliable)")
-            if (adv_h > plan_h) and adv_iso and plan_iso and (adv_iso != plan_iso):
-                _add_vrect_safe(fig, plan_iso, adv_iso, 0.05, "Advisory (less reliable)")
-                if adv_iso != x1_iso:
-                    _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
-            else:
-                if plan_iso and plan_iso != x1_iso:
+    # Shading
+    x0_iso = _x_iso(mf["date"].min())
+    x1_iso = _x_iso(mf["date"].max())
+    if x0_iso and x1_iso and pd.notna(last_obs_date):
+        if plan_cut is not None:
+            plan_iso = _x_iso(plan_cut)
+            if plan_iso:
+                _add_vrect_safe(fig, x0_iso, plan_iso, 0.10, "Planning (more reliable)")
+                if adv_cut is not None:
+                    adv_iso = _x_iso(adv_cut)
+                    if adv_iso:
+                        _add_vrect_safe(fig, plan_iso, adv_iso, 0.06, "Advisory (less reliable)")
+                        _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
+                else:
                     _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond planning")
-        else:
-            # planning_h==0 => reliable is advisory horizon
-            if plan_iso and plan_iso != x0_iso:
-                _add_vrect_safe(fig, x0_iso, plan_iso, 0.06, "Reliable")
-            if plan_iso and plan_iso != x1_iso:
-                _add_vrect_safe(fig, plan_iso, x1_iso, 0.03, "Beyond reliable")
+        elif adv_cut is not None:
+            adv_iso = _x_iso(adv_cut)
+            if adv_iso:
+                _add_vrect_safe(fig, x0_iso, adv_iso, 0.06, "Advisory (less reliable)")
+                _add_vrect_safe(fig, adv_iso, x1_iso, 0.03, "Beyond advisory")
 
     # Scenarios lines
     if scen is not None and (not scen.empty):
@@ -2318,7 +2282,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_favorable"], mode="lines", name="Scenario favorable"))
         fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_unfavorable"], mode="lines", name="Scenario unfavorable"))
 
-    # Horizon verticals (keep)
+    # Horizon verticals
     if pd.notna(last_obs_date) and adv_h > 0:
         adv_iso2 = _x_iso(last_obs_date + pd.DateOffset(months=adv_h))
         if adv_iso2:
@@ -2336,7 +2300,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Skill curve (SECOND FIGURE)
+    # Skill curve
     st.subheader(tr("📊 Skill (KGE) vs horizonte", "📊 Skill (KGE) vs horizon", LANG))
     if (not g_sk.empty) and {"horizon", "kge", "family"}.issubset(set(g_sk.columns)):
         gk = g_sk.copy()
@@ -2349,11 +2313,10 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             gg = gk[gk["family"].astype(str) == fam]
             fig2.add_trace(go.Scatter(x=gg["horizon"], y=gg["kge"], mode="lines+markers", name=str(fam)))
 
-        # thresholds (keep 0.6 / 0.3)
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
-                       y0=0.60, y1=0.60, xref="x", yref="y", line=dict(width=1, dash="dash"))
+                       y0=KGE_PLANNING_THR, y1=KGE_PLANNING_THR, xref="x", yref="y", line=dict(width=1, dash="dash"))
         fig2.add_shape(type="line", x0=gk["horizon"].min(), x1=gk["horizon"].max(),
-                       y0=0.30, y1=0.30, xref="x", yref="y", line=dict(width=1, dash="dash"))
+                       y0=KGE_ADVISORY_THR, y1=KGE_ADVISORY_THR, xref="x", yref="y", line=dict(width=1, dash="dash"))
 
         fig2.update_layout(
             height=360,
