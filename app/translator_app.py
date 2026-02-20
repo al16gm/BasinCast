@@ -1876,20 +1876,87 @@ def _try_git_commit_hash() -> str:
         pass
     return "UNKNOWN"
 
-def _resolve_core_outputs(outdir: Path) -> tuple[Path, Path, Path]:
+def _resolve_core_outputs(outdir: Path, stdout_text: str = "") -> tuple[Path, Path, Path]:
+    """
+    Resolve core outputs robustly.
+
+    First tries fixed v0.6 filenames inside outdir.
+    If missing, tries latest metrics_/skill_/forecasts_ in outdir.
+    If still missing, searches recursively under:
+      - outdir
+      - outdir.parent (runs root)
+      - current working directory (project root)
+    Also tries to parse 'Saved:' lines from stdout if present.
+    """
+    outdir = Path(outdir)
+
+    # 1) Fixed v0.6 filenames (preferred)
     fixed_metrics = outdir / "metrics_v0_6.csv"
     fixed_skill = outdir / "skill_v0_6.csv"
     fixed_fc = outdir / "forecasts_v0_6.csv"
-
     if fixed_metrics.exists() and fixed_skill.exists() and fixed_fc.exists():
         return fixed_metrics, fixed_skill, fixed_fc
 
+    # 2) Legacy prefixes inside outdir
     m = _pick_latest_csv(outdir, "metrics_")
     s = _pick_latest_csv(outdir, "skill_")
     f = _pick_latest_csv(outdir, "forecasts_")
-    if m is None or s is None or f is None:
-        raise RuntimeError(f"Core did not create expected outputs in {outdir}")
-    return m, s, f
+    if m is not None and s is not None and f is not None:
+        return m, s, f
+
+    # 3) Try to parse stdout lines like: "Saved: <path>"
+    # (Your core prints: "Saved: {metrics_path}", etc.)
+    saved_paths = {}
+    if stdout_text:
+        for line in (stdout_text or "").splitlines():
+            line = line.strip()
+            if "Saved:" in line:
+                # Example: "Metrics rows: ... | Saved: C:\\...\\metrics_v0_6.csv"
+                try:
+                    p = line.split("Saved:", 1)[1].strip()
+                    pp = Path(p)
+                    if pp.name.endswith(".csv"):
+                        saved_paths[pp.name] = pp
+                except Exception:
+                    pass
+
+    cand_m = saved_paths.get("metrics_v0_6.csv")
+    cand_s = saved_paths.get("skill_v0_6.csv")
+    cand_f = saved_paths.get("forecasts_v0_6.csv")
+    if cand_m and cand_s and cand_f and cand_m.exists() and cand_s.exists() and cand_f.exists():
+        return cand_m, cand_s, cand_f
+
+    # 4) Recursive search (core may have written somewhere else)
+    search_roots = [
+        outdir,
+        outdir.parent,             # runs root
+        Path.cwd(),                # project cwd
+    ]
+    found = {}
+    target_names = {"metrics_v0_6.csv", "skill_v0_6.csv", "forecasts_v0_6.csv"}
+    for root in search_roots:
+        try:
+            for p in root.rglob("*.csv"):
+                if p.name in target_names:
+                    found[p.name] = p
+            if target_names.issubset(found.keys()):
+                return found["metrics_v0_6.csv"], found["skill_v0_6.csv"], found["forecasts_v0_6.csv"]
+        except Exception:
+            continue
+
+    # 5) If still missing, raise with directory listing to debug
+    try:
+        files_here = sorted([p.name for p in outdir.glob("*")])[:200]
+    except Exception:
+        files_here = ["<could not list directory>"]
+
+    raise RuntimeError(
+        "Core finished but expected outputs were not found.\n"
+        f"Outdir: {outdir}\n"
+        f"Checked fixed names: metrics_v0_6.csv, skill_v0_6.csv, forecasts_v0_6.csv\n"
+        f"Also checked prefix metrics_/skill_/forecasts_ and recursive search.\n"
+        f"Files currently in outdir (first 200): {files_here}\n"
+    )
 
 def _run_core_cli(
     df_input: pd.DataFrame,
@@ -1907,7 +1974,11 @@ def _run_core_cli(
       print(f"PROGRESS {i}/{n} point_id={pid}", flush=True)
     """
     outdir.mkdir(parents=True, exist_ok=True)
-    tmp_inp = outdir / "_tmp_canonical_for_core.csv"
+
+    # ✅ FORCE ABSOLUTE PATHS (prevents "core wrote outputs elsewhere")
+    outdir_abs = outdir.resolve()
+
+    tmp_inp = outdir_abs / "_tmp_canonical_for_core.csv"
     df_input.to_csv(tmp_inp, index=False)
 
     script_candidates = [
@@ -1922,7 +1993,7 @@ def _run_core_cli(
         sys.executable,
         str(core_script),
         "--input", str(tmp_inp),
-        "--outdir", str(outdir),
+        "--outdir", str(outdir_abs),
         "--holdout_months", str(int(holdout_months)),
         "--inner_val_months", str(int(inner_val_months)),
     ]
@@ -1940,6 +2011,7 @@ def _run_core_cli(
         env=env,
         bufsize=1,
         universal_newlines=True,
+        cwd=str(Path.cwd()),  # ✅ force project cwd (prevents core writing elsewhere)
     )
 
     stdout_lines = []
@@ -1996,7 +2068,7 @@ def _run_core_cli(
     if status_box is not None and last_n > 0:
         status_box.caption(tr("Core finalizado. Cargando outputs...", "Core finished. Loading outputs...", LANG))
 
-    metrics_path, skill_path, forecasts_path = _resolve_core_outputs(outdir)
+    metrics_path, skill_path, forecasts_path = _resolve_core_outputs(outdir, stdout_text=stdout)
     metrics_df = pd.read_csv(metrics_path)
     skill_df = pd.read_csv(skill_path)
     forecasts_df = pd.read_csv(forecasts_path)
