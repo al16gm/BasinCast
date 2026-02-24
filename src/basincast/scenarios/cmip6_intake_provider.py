@@ -80,13 +80,172 @@ class CMIP6IntakeDeltaProvider:
         future_end: int,
     ) -> pd.DataFrame:
         import intake
-        import intake_esm
         import xarray as xr
+        import gcsfs
+
+        # Catalog (Google CMIP6 cloud)
+        cat_url = self.cat_url or "https://storage.googleapis.com/cmip6/pangeo-cmip6.json"
+        col = intake.open_esm_datastore(cat_url)
+
+        # Normalize lon to 0..360 if needed
+        lon2 = float(lon) % 360.0
+
+        query_common = dict(
+            table_id="Amon",
+            variable_id=["tas", "pr"],
+            grid_label="gn",
+        )
+        if self.models:
+            query_common["source_id"] = self.models
+
+        hist = col.search(experiment_id="historical", **query_common)
+        fut = col.search(experiment_id=ssp, **query_common)
+
+        if len(hist.df) == 0 or len(fut.df) == 0:
+            raise RuntimeError("CMIP6 catalog query returned no matches (check catalog availability / filters).")
+
+        # We will open zarr stores directly (more robust than to_dataset_dict)
+        if "zstore" not in hist.df.columns or "zstore" not in fut.df.columns:
+            raise RuntimeError("Catalog does not contain 'zstore' column; cannot open CMIP6 zarr stores directly.")
+
+        fs = gcsfs.GCSFileSystem(token="anon", asynchronous=False)
+
+        def extract_point_series_from_df(df_assets: pd.DataFrame, var: str, y0: int, y1: int) -> pd.Series:
+            """
+            Build an ensemble time series at (lat,lon) for one variable from many zstores.
+            Skips models/stores that fail to open.
+            Returns a pandas Series indexed by month-start timestamps.
+            """
+            series_list = []
+
+            # Iterate per zstore (each usually corresponds to one model/member/variable)
+            for zstore in df_assets.loc[df_assets["variable_id"] == var, "zstore"].dropna().unique().tolist():
+                try:
+                    mapper = fs.get_mapper(zstore)
+                    import warnings
+                    import xarray as xr
+
+                    time_coder = xr.coders.CFDatetimeCoder(use_cftime=True)
+
+                    # inside your loop, replace the open_zarr call with:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", category=FutureWarning)
+                        ds = xr.open_zarr(
+                            mapper,
+                            consolidated=True,
+                            decode_times=time_coder,
+                        )
+
+                    if var not in ds:
+                        continue
+
+                    da = ds[var]
+
+                    # Select point (nearest) and time slice
+                    # Some datasets use lon 0..360
+                    if "lon" in da.coords:
+                        da_pt = da.sel(lat=float(lat), lon=float(lon2), method="nearest")
+                    else:
+                        da_pt = da.sel(lat=float(lat), method="nearest")
+
+                    da_pt = da_pt.sel(time=slice(f"{y0}-01-01", f"{y1}-12-31"))
+
+                    # Convert time coordinate safely (cftime-friendly)
+                    tvals = da_pt["time"].values
+                    dates = [pd.Timestamp(int(t.year), int(t.month), 1) for t in tvals]
+
+                    vals = da_pt.values.astype(float)
+                    s = pd.Series(vals, index=pd.DatetimeIndex(dates))
+                    s = s.resample("MS").mean()
+
+                    # Drop NaNs
+                    s = s.dropna()
+                    if len(s) > 0:
+                        series_list.append(s)
+
+                except Exception:
+                    # Skip broken stores/models (do not fail whole run)
+                    continue
+
+            if not series_list:
+                return pd.Series(dtype=float)
+
+            mat = pd.concat(series_list, axis=1)
+
+            if self.statistic == "median":
+                out = mat.median(axis=1)
+            else:
+                out = mat.mean(axis=1)
+
+            out = out.sort_index()
+            return out
+
+        # Build asset tables
+        hist_assets = hist.df.copy()
+        fut_assets = fut.df.copy()
+
+        tas_base = extract_point_series_from_df(hist_assets, "tas", baseline_start, baseline_end)
+        pr_base = extract_point_series_from_df(hist_assets, "pr", baseline_start, baseline_end)
+
+        tas_fut = extract_point_series_from_df(fut_assets, "tas", future_start, future_end)
+        pr_fut = extract_point_series_from_df(fut_assets, "pr", future_start, future_end)
+
+        if tas_base.empty or pr_base.empty or tas_fut.empty or pr_fut.empty:
+            raise RuntimeError(
+                "CMIP6 extraction returned empty series. "
+                "Possible causes: network restrictions, missing models for this point, or catalog outage."
+            )
+
+        # Units:
+        # tas: Kelvin -> °C
+        tas_base = tas_base - 273.15
+        tas_fut = tas_fut - 273.15
+
+        # Convert to DataFrames
+        tas_base_df = tas_base.rename("tas").reset_index().rename(columns={"index": "date"})
+        pr_base_df = pr_base.rename("pr").reset_index().rename(columns={"index": "date"})
+        tas_fut_df = tas_fut.rename("tas").reset_index().rename(columns={"index": "date"})
+        pr_fut_df = pr_fut.rename("pr").reset_index().rename(columns={"index": "date"})
+
+        for ddf in (tas_base_df, pr_base_df, tas_fut_df, pr_fut_df):
+            ddf["date"] = pd.to_datetime(ddf["date"]).dt.to_period("M").dt.to_timestamp()
+            ddf["year"] = ddf["date"].dt.year.astype(int)
+            ddf["month"] = ddf["date"].dt.month.astype(int)
+
+        # Baseline monthly climatology
+        tas_base_clim = tas_base_df.groupby("month")["tas"].mean().rename("tas_base").reset_index()
+        pr_base_clim = pr_base_df.groupby("month")["pr"].mean().rename("pr_base").reset_index()
+
+        # Future year-month means
+        tas_fut_ym = tas_fut_df.groupby(["year", "month"])["tas"].mean().rename("tas_fut").reset_index()
+        pr_fut_ym = pr_fut_df.groupby(["year", "month"])["pr"].mean().rename("pr_fut").reset_index()
+
+        df = tas_fut_ym.merge(pr_fut_ym, on=["year", "month"], how="inner")
+        df = df.merge(tas_base_clim, on="month", how="left")
+        df = df.merge(pr_base_clim, on="month", how="left")
+
+        df["delta_temp_add"] = df["tas_fut"] - df["tas_base"]
+
+        eps = 1e-9
+        df["delta_precip_mult"] = (df["pr_fut"] / (df["pr_base"].abs() + eps)) - 1.0
+
+        out = df[["year", "month", "delta_temp_add", "delta_precip_mult"]].copy()
+        out = out.sort_values(["year", "month"]).reset_index(drop=True)
+        return out
 
         # Default catalog: Google CMIP6 cloud catalog via intake-esm docs/notebooks
         # Users can override cat_url if needed.
         cat_url = self.cat_url or "https://storage.googleapis.com/cmip6/pangeo-cmip6.json"
         col = intake.open_esm_datastore(cat_url)
+
+        def _normalize_lon_for_cmip(lon: float) -> float:
+            # CMIP6 lon is often 0..360; your canonical uses -180..180.
+            return lon % 360.0
+
+
+        def _month_start_from_timeobj(t) -> pd.Timestamp:
+            # Works for both cftime and numpy/pandas datetime objects
+            return pd.Timestamp(int(t.year), int(t.month), 1)
 
         # We need:
         # - historical tas/pr for baseline

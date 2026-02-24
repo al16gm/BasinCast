@@ -1,5 +1,5 @@
 # translator_app.py
-# BasinCast Translator — Clean consolidated version (v0.13.4-ready)
+# BasinCast Translator — Clean consolidated version (v0.16-ready)
 # - No duplicated meteo blocks
 # - Demand A/B/C fixed (no dem_mode NameError)
 # - Paper-friendly tables + monthly forecast path preserved
@@ -59,7 +59,7 @@ from basincast.meteo.geocode import geocode_place, reverse_geocode
 # -----------------------------
 # App config
 # -----------------------------
-APP_VERSION = "v0.15.1"
+APP_VERSION = "v0.16"
 st.set_page_config(page_title=f"BasinCast Translator ({APP_VERSION})", layout="wide")
 
 LANG = language_selector(default="en")
@@ -1800,10 +1800,10 @@ if cwd is not None:
 
 
 # -----------------------------
-# 10) Run BasinCast + Visualize (v0.14)  [v0.15 UX patch]
+# 10) Run BasinCast + Visualize (v0.16) 
 # -----------------------------
 st.markdown("---")
-st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.14)", "📈 Run BasinCast Core + Visualize (v0.14)", LANG))
+st.header(tr("📈 Ejecutar BasinCast + Visualizar (v0.16)", "📈 Run BasinCast Core + Visualize (v0.16)", LANG))
 
 import json
 import hashlib
@@ -1880,7 +1880,7 @@ def _resolve_core_outputs(outdir: Path, stdout_text: str = "") -> tuple[Path, Pa
     """
     Resolve core outputs robustly.
 
-    First tries fixed v0.6 filenames inside outdir.
+    First tries fixed v0.16 filenames inside outdir.
     If missing, tries latest metrics_/skill_/forecasts_ in outdir.
     If still missing, searches recursively under:
       - outdir
@@ -1890,7 +1890,7 @@ def _resolve_core_outputs(outdir: Path, stdout_text: str = "") -> tuple[Path, Pa
     """
     outdir = Path(outdir)
 
-    # 1) Fixed v0.6 filenames (preferred)
+    # 1) Fixed v0.16 filenames (preferred)
     fixed_metrics = outdir / "metrics_v0_6.csv"
     fixed_skill = outdir / "skill_v0_6.csv"
     fixed_fc = outdir / "forecasts_v0_6.csv"
@@ -2053,6 +2053,28 @@ def _run_core_cli(
 
     proc.wait()
 
+    # --- Post-run rescue: if core wrote outputs elsewhere, copy them into run_outdir ---
+    expected = ["metrics_v0_6.csv", "skill_v0_6.csv", "forecasts_v0_6.csv", "forecasts_scenarios_v0_6.csv"]
+
+    missing = [fn for fn in expected if not (outdir / fn).exists()]
+    if missing:
+        # Search recursively from project root for latest matching outputs
+        root = Path.cwd()
+        found = {}
+        for fn in expected:
+            hits = sorted(root.rglob(fn), key=lambda p: p.stat().st_mtime, reverse=True)
+            if hits:
+                found[fn] = hits[0]
+
+        # Copy only if found and not already present
+        for fn, src in found.items():
+            dst = outdir / fn
+            if not dst.exists():
+                try:
+                    dst.write_bytes(src.read_bytes())
+                except Exception:
+                    pass
+
     stdout = "".join(stdout_lines)
     stderr = ""  # merged into stdout
 
@@ -2068,10 +2090,34 @@ def _run_core_cli(
     if status_box is not None and last_n > 0:
         status_box.caption(tr("Core finalizado. Cargando outputs...", "Core finished. Loading outputs...", LANG))
 
+    def _read_csv_nonempty(p: Path) -> pd.DataFrame:
+        p = Path(p)
+        if (not p.exists()) or p.stat().st_size == 0:
+            raise RuntimeError(f"Core output is missing or empty: {p}")
+        df0 = pd.read_csv(p)
+        if df0 is None or df0.empty:
+            raise RuntimeError(f"Core output parsed but is empty: {p}")
+        return df0
+
     metrics_path, skill_path, forecasts_path = _resolve_core_outputs(outdir, stdout_text=stdout)
-    metrics_df = pd.read_csv(metrics_path)
-    skill_df = pd.read_csv(skill_path)
-    forecasts_df = pd.read_csv(forecasts_path)
+
+    metrics_df = _read_csv_nonempty(metrics_path)
+    skill_df = _read_csv_nonempty(skill_path)
+    forecasts_df = _read_csv_nonempty(forecasts_path)
+
+    # ✅ NEW: load scenario forecasts (may be empty if ENDO-only or scenario provider failed)
+    scen_path = outdir / "forecasts_scenarios_v0_6.csv"
+    if scen_path.exists() and scen_path.stat().st_size > 0:
+        scenarios_df = pd.read_csv(scen_path)
+    else:
+        scenarios_df = pd.DataFrame()
+
+    # Store for downstream plots (no need to guess variable plumbing)
+    try:
+        st.session_state["core_last_outdir"] = str(outdir)
+        st.session_state["core_scenarios_df"] = scenarios_df
+    except Exception:
+        pass
 
     return {
         "stdout": stdout,
@@ -2079,10 +2125,12 @@ def _run_core_cli(
         "metrics": metrics_df,
         "skill": skill_df,
         "forecasts": forecasts_df,
+        "scenarios": scenarios_df,
         "paths": {
             "metrics": str(metrics_path),
             "skill": str(skill_path),
             "forecasts": str(forecasts_path),
+            "scenarios": str(scen_path),
         },
     }
 
@@ -2305,11 +2353,27 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             else:
                 st.dataframe(g_sk, use_container_width=True)
 
-    # Scenarios
-    st.subheader(tr("🌦️ Escenarios climáticos (bandas simples)", "🌦️ Climate scenarios (simple bands)", LANG))
-    fav_pct = st.slider(tr("% favorable", "% favorable", LANG), min_value=0, max_value=30, value=5, step=1) / 100.0
-    unf_pct = st.slider(tr("% unfavorable", "% unfavorable", LANG), min_value=0, max_value=30, value=5, step=1) / 100.0
-    scen = _paper_scenario_bands(monthly_fc, favorable_pct=fav_pct, unfavorable_pct=unf_pct)
+    # Scenarios (CMIP6 – produced by Core)
+    st.subheader(tr("🌦️ Escenarios climáticos (CMIP6)", "🌦️ Climate scenarios (CMIP6)", LANG))
+
+    # We plot real scenarios from the Core output (forecasts_scenarios_v0_6.csv)
+    # which is loaded into st.session_state["core_scenarios_df"] by run_core_and_load_outputs().
+    scen = None
+    scenarios_df = st.session_state.get("core_scenarios_df", pd.DataFrame())
+    if scenarios_df is None or scenarios_df.empty:
+        st.info(tr(
+            "Este run no incluye escenarios CMIP6 (no existe forecasts_scenarios_v0_6.csv o está vacío).",
+            "This run does not include CMIP6 scenarios (forecasts_scenarios_v0_6.csv missing/empty).",
+            LANG,
+        ))
+    else:
+        if "scenario" in scenarios_df.columns:
+            available = sorted(scenarios_df["scenario"].astype(str).unique().tolist())
+            st.caption(tr(
+                f"Escenarios disponibles: {available}",
+                f"Available scenarios: {available}",
+                LANG,
+            ))
 
     # ---- Monthly plot (ONLY ONCE) ----
     st.subheader(tr("📉 Serie temporal + predicción (mensual)", "📉 Time series + forecasts (monthly)", LANG))
@@ -2363,11 +2427,34 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
     g_obs_plot = g_obs.copy()
     g_obs_plot["date"] = pd.to_datetime(g_obs_plot["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     g_obs_plot = g_obs_plot.dropna(subset=["date"]).sort_values("date")
-    fig.add_trace(go.Scatter(x=g_obs_plot["date"], y=g_obs_plot["value"], mode="lines", name="Observed"))
 
     mf = monthly_fc.copy()
     mf["date"] = pd.to_datetime(mf["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     mf = mf.dropna(subset=["date"]).sort_values("date")
+
+    # -----------------------------
+    # Optional time zoom (range slider)
+    # -----------------------------
+    min_d = pd.to_datetime(min(g_obs_plot["date"].min(), mf["date"].min()), errors="coerce")
+    max_d = pd.to_datetime(max(g_obs_plot["date"].max(), mf["date"].max()), errors="coerce")
+
+    use_zoom = st.checkbox("🔎 Zoom timeline (optional)", value=False, key=f"zoom_{pid}")
+    if use_zoom and pd.notna(min_d) and pd.notna(max_d):
+        d0, d1 = st.slider(
+            "Time window",
+            min_value=min_d.to_pydatetime(),
+            max_value=max_d.to_pydatetime(),
+            value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+            format="YYYY-MM",
+            key=f"zoom_window_{pid}",
+        )
+        d0_ts = pd.to_datetime(d0).to_period("M").to_timestamp()
+        d1_ts = pd.to_datetime(d1).to_period("M").to_timestamp()
+
+        g_obs_plot = g_obs_plot[(g_obs_plot["date"] >= d0_ts) & (g_obs_plot["date"] <= d1_ts)].copy()
+        mf = mf[(mf["date"] >= d0_ts) & (mf["date"] <= d1_ts)].copy()
+
+    fig.add_trace(go.Scatter(x=g_obs_plot["date"], y=g_obs_plot["value"], mode="lines", name="Observed"))
 
     # -----------------------------
     # ✅ FIX: ALWAYS show Planning vs Advisory vs Beyond segments
@@ -2444,13 +2531,97 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             # No horizons available -> no shading
             pass
 
-    # Scenarios lines
-    if scen is not None and (not scen.empty):
-        scen_plot = scen.copy()
-        scen_plot["date"] = pd.to_datetime(scen_plot["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-        scen_plot = scen_plot.dropna(subset=["date"]).sort_values("date")
-        fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_favorable"], mode="lines", name="Scenario favorable"))
-        fig.add_trace(go.Scatter(x=scen_plot["date"], y=scen_plot["scenario_unfavorable"], mode="lines", name="Scenario unfavorable"))
+    # -----------------------------
+    # Scenario uncertainty band (Favorable/Base/Unfavorable)
+    # -----------------------------
+    scenarios_df = st.session_state.get("core_scenarios_df", pd.DataFrame())
+    if scenarios_df is not None and (not scenarios_df.empty):
+        sc = scenarios_df.copy()
+        sc["date"] = pd.to_datetime(sc["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        sc = sc.dropna(subset=["date"]).copy()
+
+        # Filter to this point_id
+        sc = sc[sc["point_id"].astype(str) == str(pid)].copy()
+
+        # Reduce clutter: prefer EXOG scenarios if available (scenarios usually apply to EXOG forcing)
+        if "family" in sc.columns:
+            exog_mask = sc["family"].astype(str).str.contains("EXOG", case=False, na=False)
+            sc_exog = sc[exog_mask].copy()
+            if not sc_exog.empty:
+                sc = sc_exog
+
+        # Reduce clutter further: keep the most common (family, model_type) combination if present
+        if {"family", "model_type"}.issubset(set(sc.columns)) and (not sc.empty):
+            combo = sc.assign(
+                _fam=sc["family"].astype(str),
+                _mt=sc["model_type"].astype(str),
+            )
+            top = (
+                combo.groupby(["_fam", "_mt"])
+                .size()
+                .sort_values(ascending=False)
+                .head(1)
+            )
+            if len(top) == 1:
+                fam0, mt0 = top.index[0]
+                sc2 = sc[(sc["family"].astype(str) == fam0) & (sc["model_type"].astype(str) == mt0)].copy()
+                if not sc2.empty:
+                    sc = sc2
+
+        # Plot scenario trajectories (Base/Favorable/Unfavorable) as real lines
+        if (not sc.empty) and ("scenario" in sc.columns):
+            preferred = ["Favorable", "Base", "Unfavorable"]
+            scen_list = preferred + [s for s in sorted(sc["scenario"].astype(str).unique()) if s not in preferred]
+
+            for sname in scen_list:
+                gg = sc[sc["scenario"].astype(str) == sname].sort_values("date").copy()
+                if gg.empty:
+                    continue
+
+                # respect zoom window (if applied)
+                if "use_zoom" in locals() and use_zoom:
+                    gg = gg[(gg["date"] >= d0) & (gg["date"] <= d1)].copy()
+
+                fig.add_trace(go.Scatter(
+                    x=gg["date"],
+                    y=gg["y_forecast"],
+                    mode="lines",
+                    name=f"Scenario {sname}",
+                ))
+
+        # If you want ONLY the selected family, uncomment:
+        # sc = sc[sc["family"].astype(str) == str(selected_family)].copy()
+
+        if not sc.empty:
+            band = (
+                sc.groupby("date", as_index=False)["y_forecast"]
+                .agg(low="min", high="max")
+                .sort_values("date")
+            )
+
+            # respect zoom window (if applied)
+            if "use_zoom" in locals() and use_zoom:
+                band = band[(band["date"] >= d0) & (band["date"] <= d1)].copy()
+
+            if len(band) > 1:
+                # Plotly fill between high and low
+                fig.add_trace(go.Scatter(
+                    x=band["date"], y=band["high"],
+                    mode="lines",
+                    line=dict(width=0),
+                    name="Scenario envelope (max)",
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=band["date"], y=band["low"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    name="Scenario uncertainty band",
+                    hoverinfo="skip",
+                ))
+
 
     # Horizon verticals (keep)
     if pd.notna(last_obs_date) and adv_h > 0:

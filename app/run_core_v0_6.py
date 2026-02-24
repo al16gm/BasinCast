@@ -369,74 +369,101 @@ def recursive_forecast_path_delta(
 
 
 def seasonal_naive_path(history: pd.DataFrame, start_date: pd.Timestamp, horizon_max: int) -> List[Tuple[pd.Timestamp, float]]:
+    """
+    Seasonal naive (RECURSIVE): repeat last-year monthly pattern.
+    This avoids the "flat after 12 months" problem.
+    """
+    hist = history.copy()
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist = hist.sort_values("date").reset_index(drop=True)
 
-    def extend_exog_with_monthly_climatology(
-        exog_df: pd.DataFrame,
-        origin: pd.Timestamp,
-        horizon_max: int,
-        include_meteo: bool,
-        include_demand: bool,
-    ) -> pd.DataFrame:
-        """
-        Extend exog_df (historical) with future rows up to origin + horizon_max months.
-        Future values are filled using monthly climatology computed from historical data.
+    start_date = _to_month_start(start_date)
+    idx0 = hist.index[hist["date"] == start_date]
+    if len(idx0) == 0:
+        raise ValueError(f"start_date {start_date} not found in history.")
+    i0 = int(idx0[0])
 
-        This keeps existing fallback logic but makes scenario exog effective beyond h=1.
-        """
-        if exog_df is None or exog_df.empty:
-            return exog_df
+    y_buffer = hist.loc[:i0, "value"].astype(float).to_list()
+    cur_date = start_date
 
-        ed = exog_df.copy()
-        ed["date"] = pd.to_datetime(ed["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-        ed = ed.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    preds: List[Tuple[pd.Timestamp, float]] = []
+    for _ in range(int(horizon_max)):
+        next_date = (cur_date + pd.DateOffset(months=1)).to_period("M").to_timestamp()
+        if len(y_buffer) >= 12:
+            y_next = float(y_buffer[-12])
+        else:
+            y_next = float(y_buffer[-1])
+        preds.append((next_date, y_next))
+        y_buffer.append(y_next)
+        cur_date = next_date
 
-        # Compute monthly climatologies from historical data
-        clim_meteo = None
-        clim_demand = None
+    return preds
 
-        if include_meteo:
-            # EXOG_METEO_COLS must exist in your file (it does in v0.6)
-            clim_meteo = ed.groupby(ed["date"].dt.month)[EXOG_METEO_COLS].mean(numeric_only=True)
+def extend_exog_with_monthly_climatology(
+    exog_df: pd.DataFrame,
+    origin: pd.Timestamp,
+    horizon_max: int,
+    include_meteo: bool,
+    include_demand: bool,
+) -> pd.DataFrame:
+    """
+    Extend historical exog_df with future rows up to origin + horizon_max months.
+    Future values are filled using monthly climatology computed from historical data.
 
-        if include_demand and (DEMAND_COL in ed.columns):
-            tmp = pd.to_numeric(ed[DEMAND_COL], errors="coerce")
-            clim_demand = tmp.groupby(ed["date"].dt.month).mean()
+    This makes CMIP6 deltas affect the whole horizon (h>1), not only the first step.
+    """
+    if exog_df is None or exog_df.empty:
+        return exog_df
 
-        origin = _to_month_start(origin)
-        last_needed = _to_month_start(origin + pd.DateOffset(months=int(horizon_max)))
+    ed = exog_df.copy()
+    ed["date"] = pd.to_datetime(ed["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    ed = ed.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-        future_dates = pd.date_range(
-            start=_to_month_start(origin + pd.DateOffset(months=1)),
-            end=last_needed,
-            freq="MS",
-        )
+    clim_meteo = None
+    clim_demand = None
 
-        existing = set(ed["date"].tolist())
-        rows: List[dict] = []
+    if include_meteo:
+        clim_meteo = ed.groupby(ed["date"].dt.month)[EXOG_METEO_COLS].mean(numeric_only=True)
 
-        for d in future_dates:
-            d = _to_month_start(d)
-            if d in existing:
-                continue
+    if include_demand and (DEMAND_COL in ed.columns):
+        tmp = pd.to_numeric(ed[DEMAND_COL], errors="coerce")
+        clim_demand = tmp.groupby(ed["date"].dt.month).mean()
 
-            m = int(d.month)
-            row: dict = {"date": d}
+    origin = _to_month_start(origin)
+    last_needed = _to_month_start(origin + pd.DateOffset(months=int(horizon_max)))
 
-            if include_meteo and (clim_meteo is not None):
-                vals = clim_meteo.loc[m].to_dict()
-                for c in EXOG_METEO_COLS:
-                    row[c] = float(vals[c])
+    future_dates = pd.date_range(
+        start=_to_month_start(origin + pd.DateOffset(months=1)),
+        end=last_needed,
+        freq="MS",
+    )
 
-            if include_demand and (clim_demand is not None):
-                row[DEMAND_COL] = float(clim_demand.loc[m])
+    existing = set(ed["date"].tolist())
+    rows: List[dict] = []
 
-            rows.append(row)
+    for d in future_dates:
+        d = _to_month_start(d)
+        if d in existing:
+            continue
 
-        if rows:
-            ed = pd.concat([ed, pd.DataFrame(rows)], ignore_index=True)
-            ed = ed.sort_values("date").reset_index(drop=True)
+        m = int(d.month)
+        row: dict = {"date": d}
 
-        return ed
+        if include_meteo and (clim_meteo is not None):
+            vals = clim_meteo.loc[m].to_dict()
+            for c in EXOG_METEO_COLS:
+                row[c] = float(vals[c])
+
+        if include_demand and (clim_demand is not None):
+            row[DEMAND_COL] = float(clim_demand.loc[m])
+
+        rows.append(row)
+
+    if rows:
+        ed = pd.concat([ed, pd.DataFrame(rows)], ignore_index=True)
+        ed = ed.sort_values("date").reset_index(drop=True)
+
+    return ed
 
 # -----------------------------
 # Backtest + decision
@@ -568,7 +595,10 @@ def run_point(
 
                 if fam == "BASELINE_SEASONAL":
                     # recursive seasonal naive (multi-step)
-                    y_hat = seasonal_naive_path(dfp[["date", "value"]], origin, int(h))[-1][1]
+                    path = seasonal_naive_path(dfp[["date", "value"]], origin, int(h))
+                    if not path:
+                        raise RuntimeError("seasonal_naive_path returned empty/None path")
+                    y_hat = path[-1][1]
                 else:
                     if fam not in model_info:
                         continue
@@ -764,98 +794,134 @@ def run_point(
 
     forecasts_df = pd.DataFrame(forecasts)
 
-     # -----------------------------
-    # NEW: Scenario forecasts (CMIP6 delta-change, year-month dependent)
-    # Families map to SSPs:
-    #   Favorable -> ssp126
-    #   Base -> ssp245
-    #   Unfavorable -> ssp585
+        # -----------------------------
+    # NEW: Scenario forecasts (DeltaPack: CMIP6 precomputed deltas, year-month dependent)
+    # We generate scenarios using the best EXOG family available,
+    # even if the overall winner (selected) is BASELINE/ENDO.
     # -----------------------------
     scenario_rows: List[dict] = []
 
     try:
-        needs_meteo_for_selected = selected in ("EXOG_ML", "EXOG_ML_DEMAND")
-        if needs_meteo_for_selected and final_model is not None and (exog_df is not None) and (not exog_df.empty):
-            # Extend exog to cover future months (so scenarios affect the whole horizon)
-            exog_ext = extend_exog_with_monthly_climatology(
-                exog_df=exog_df,
-                origin=origin,
-                horizon_max=Hmax,
-                include_meteo=True,
-                include_demand=(selected == "EXOG_ML_DEMAND"),
-            )
+        # Need exogenous drivers and location to apply deltas
+        if (exog_df is None) or exog_df.empty:
+            print(">>> Scenarios: skipped (exog_df is empty)", flush=True)
+        else:
+            lat = float(dfp["lat"].iloc[0]) if "lat" in dfp.columns else np.nan
+            lon = float(dfp["lon"].iloc[0]) if "lon" in dfp.columns else np.nan
+            if np.isnan(lat) or np.isnan(lon):
+                print(">>> Scenarios: skipped (missing lat/lon)", flush=True)
+            else:
+                # Choose EXOG family for scenario generation
+                scenario_family = "EXOG_ML_DEMAND" if has_demand else "EXOG_ML"
 
-            # Baseline is global from the input file; future starts after baseline end
-            future_start_year = int(baseline_end_year) + 1
-            if future_start_year <= int(future_end_year):
-                provider = CMIP6IntakeDeltaProvider(
-                    cache_dir=Path(cmip6_cache_dir),
-                    models=None,
-                    statistic="mean",
-                    grid_method="nearest",
-                    cat_url=None,
+                # Train a dedicated EXOG model for scenarios (independent from 'selected')
+                feats_all = make_features(dfp, scenario_family)
+                if len(feats_all) < 24:
+                    raise RuntimeError(f"Scenarios: not enough rows to train {scenario_family} (need >=24)")
+
+                X_all = feats_all.drop(columns=["date", "delta_y"]).to_numpy()
+                y_all = feats_all["delta_y"].to_numpy()
+                scenario_model, scenario_model_type, _, _ = train_select_model(X_all, y_all, None, None)
+
+                # Extend exog to cover the whole horizon (so deltas affect h>1)
+                exog_ext = extend_exog_with_monthly_climatology(
+                    exog_df=exog_df,
+                    origin=origin,
+                    horizon_max=Hmax,
+                    include_meteo=True,
+                    include_demand=(scenario_family == "EXOG_ML_DEMAND"),
                 )
 
-                # point lat/lon (required for CMIP6 extraction)
-                lat = float(dfp["lat"].iloc[0]) if "lat" in dfp.columns else np.nan
-                lon = float(dfp["lon"].iloc[0]) if "lon" in dfp.columns else np.nan
+                future_start_year = int(baseline_end_year) + 1
+                if future_start_year > int(future_end_year):
+                    print(">>> Scenarios: skipped (future_start_year > future_end_year)", flush=True)
+                else:
+                    # DeltaPack provider (local precomputed CMIP6 deltas)
+                    from basincast.scenarios.deltapack_provider import DeltaPackProvider
 
-                if not np.isnan(lat) and not np.isnan(lon):
-                    for scen_name, ssp in [("Favorable", "ssp126"), ("Base", "ssp245"), ("Unfavorable", "ssp585")]:
-                        deltas_df = provider.get_deltas(
-                            lat=lat,
-                            lon=lon,
-                            family=scen_name,  # provider maps family -> ssp internally
-                            baseline_start=baseline_start_year,
-                            baseline_end=baseline_end_year,
-                            future_start=future_start_year,
-                            future_end=future_end_year,
-                        )
+                    # Resolve run directory: .../run_x/cache/cmip6_deltas -> run_x
+                    run_dir = Path(cmip6_cache_dir).resolve().parents[2]
+                    proj_dir = Path(__file__).resolve().parents[1]  # .../app -> project root
 
-                        exog_scen = apply_year_month_deltas_to_exog(
-                            exog_future=exog_ext,
-                            deltas=deltas_df,
-                            date_col="date",
-                            precip_col="precip_mm_month_est",
-                            temp_col="t2m_c",
-                            tmax_col="tmax_c",
-                            tmin_col="tmin_c",
-                        )
+                    # Candidate locations for the deltapack folder
+                    pack_candidates = [
+                        run_dir / "cache" / "deltapack_cmip6_v1",          # per-run cache (recommended)
+                        proj_dir / "outputs" / "cache" / "deltapack_cmip6_v1",  # global cache
+                        proj_dir / "deltapack_cmip6_v1",                   # project-level folder
+                    ]
+                    pack_root = next((p for p in pack_candidates if (p / "metadata.json").exists()), None)
 
-                        path_scen = recursive_forecast_path_delta(
-                            model=final_model,
-                            history=dfp[["date", "value"]],
-                            exog_df=exog_scen,
-                            start_date=origin,
-                            horizon_max=Hmax,
-                            family=selected,
-                        )
+                    if pack_root is None:
+                        print(">>> Scenarios: skipped (DeltaPack not found: deltapack_cmip6_v1)", flush=True)
+                    else:
+                        provider = DeltaPackProvider.load(pack_root)
 
-                        for i, (dtt, yhat) in enumerate(path_scen, start=1):
-                            scenario_rows.append(
-                                {
-                                    "point_id": point_id,
-                                    "resource_type": resource_type,
-                                    "unit": unit,
-                                    "family": selected,
-                                    "model_type": str(final_model_type),
-                                    "scenario": scen_name,
-                                    "ssp": ssp,
-                                    "date": str(_to_month_start(dtt).date()),
-                                    "horizon": int(i),
-                                    "y_forecast": float(yhat),
-                                }
+                        for scen_name, ssp in [("Favorable", "ssp126"), ("Base", "ssp245"), ("Unfavorable", "ssp585")]:
+                            deltas_df = provider.get_deltas(
+                                lat=lat,
+                                lon=lon,
+                                family=scen_name,
+                                baseline_start_year=baseline_start_year,
+                                baseline_end_year=baseline_end_year,
+                                future_start_year=future_start_year,
+                                future_end_year=future_end_year,
                             )
-    except Exception:
-        # If scenario generation fails, keep it empty (do not break production run)
-        pass
+
+                            exog_scen = apply_year_month_deltas_to_exog(
+                                exog_future=exog_ext,
+                                deltas=deltas_df,
+                                date_col="date",
+                                precip_col="precip_mm_month_est",
+                                temp_col="t2m_c",
+                                tmax_col="tmax_c",
+                                tmin_col="tmin_c",
+                            )
+
+                            path_scen = recursive_forecast_path_delta(
+                                model=scenario_model,
+                                history=dfp[["date", "value"]],
+                                exog_df=exog_scen,
+                                start_date=origin,
+                                horizon_max=Hmax,
+                                family=scenario_family,
+                            )
+
+                            for i, (dtt, yhat) in enumerate(path_scen, start=1):
+                                scenario_rows.append(
+                                    {
+                                        "point_id": point_id,
+                                        "resource_type": resource_type,
+                                        "unit": unit,
+                                        "family": scenario_family,   # EXOG family used for scenarios
+                                        "model_type": str(scenario_model_type),
+                                        "scenario": scen_name,
+                                        "ssp": ssp,
+                                        "date": str(_to_month_start(dtt).date()),
+                                        "horizon": int(i),
+                                        "y_forecast": float(yhat),
+                                    }
+                                )
+
+    except Exception as e:
+        # Do not break the run, but write an error file into the run folder
+        print(f">>> Scenarios: FAILED: {e!r}", flush=True)
+        try:
+            run_dir = Path(cmip6_cache_dir).resolve().parents[2]
+            (run_dir / "_SCENARIOS_ERROR.txt").write_text(repr(e), encoding="utf-8")
+        except Exception:
+            pass
 
     forecasts_scenarios_df = pd.DataFrame(scenario_rows)
 
-    return metrics_df, skill_df, forecasts_df, forecasts_scenarios_df
+    return metrics_df, skill_df, forecasts_df, forecasts_scenarios_df   
 
 
 def main() -> None:
+    import json
+
+    # --- DEBUG sentinel (must always appear if main() runs) ---
+    print(">>> DEBUG: entered main() in run_core_v0_6.py")
+
     ap = argparse.ArgumentParser(description="BasinCast Core v0.6 (ENDO vs EXOG vs Baseline).")
     ap.add_argument("--input", required=True, help="Path to canonical_with_meteo.csv (or canonical without meteo)")
     ap.add_argument("--outdir", default="outputs", help="Output folder")
@@ -863,13 +929,25 @@ def main() -> None:
     ap.add_argument("--inner_val_months", type=int, default=36)
     args = ap.parse_args()
 
+    # Use absolute outdir
+    outdir = Path(args.outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Sentinel files (debug)
+    (outdir / "_CORE_STARTED.txt").write_text("core started OK\n", encoding="utf-8")
+    (outdir / "_CORE_ARGS.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+
     inp = Path(args.input)
     if not inp.exists():
         raise FileNotFoundError(inp)
 
     df = pd.read_csv(inp)
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
-    df = df.sort_values(["point_id", "date"]).reset_index(drop=True)
+    df = df.dropna(subset=["date"]).sort_values(["point_id", "date"]).reset_index(drop=True)
+
+    if df.empty:
+        raise RuntimeError("Input canonical is empty after parsing dates.")
+
     # Global baseline from uploaded canonical file (dynamic)
     baseline_start_year = int(df["date"].min().year)
     baseline_end_year = int(df["date"].max().year)
@@ -881,8 +959,8 @@ def main() -> None:
 
     cfg = RunConfig(
         horizons=[12, 24, 36, 48],
-        holdout_months=args.holdout_months,
-        inner_val_months=args.inner_val_months,
+        holdout_months=int(args.holdout_months),
+        inner_val_months=int(args.inner_val_months),
     )
 
     all_metrics: List[pd.DataFrame] = []
@@ -890,21 +968,40 @@ def main() -> None:
     all_fc: List[pd.DataFrame] = []
     all_fc_scen: List[pd.DataFrame] = []
 
-    for point_id, g in df.groupby("point_id", sort=True):
+    n_points = int(df["point_id"].nunique())
+
+    for i, (point_id, g) in enumerate(df.groupby("point_id", sort=True), start=1):
+        print(f"PROGRESS {i}/{n_points} point_id={point_id}", flush=True)
+
         m, s, f, fs = run_point(
             g,
             cfg,
             baseline_start_year=baseline_start_year,
             baseline_end_year=baseline_end_year,
             future_end_year=2050,
-            cmip6_cache_dir=str(Path(args.outdir) / "cache" / "cmip6_deltas"),
+            cmip6_cache_dir=str(outdir / "cache" / "cmip6_deltas"),
         )
 
+        # Per-point sanity checks: don't allow silent empties
+        if m is None or m.empty:
+            raise RuntimeError(f"run_point returned EMPTY metrics for point_id={point_id}")
+        if s is None or s.empty:
+            raise RuntimeError(f"run_point returned EMPTY skill for point_id={point_id}")
+        if f is None or f.empty:
+            raise RuntimeError(f"run_point returned EMPTY forecasts for point_id={point_id}")
+
+        all_metrics.append(m)
+        all_skill.append(s)
+        all_fc.append(f)
+        if fs is not None and (not fs.empty):
+            all_fc_scen.append(fs)
+
+    # ✅ Build outputs (THIS LINE WAS MISSING IN YOUR VERSION)
     metrics_df = pd.concat(all_metrics, ignore_index=True) if all_metrics else pd.DataFrame()
     skill_df = pd.concat(all_skill, ignore_index=True) if all_skill else pd.DataFrame()
     fc_df = pd.concat(all_fc, ignore_index=True) if all_fc else pd.DataFrame()
 
-    # If no scenarios were generated, still create an empty DF with stable columns
+    # Scenarios output (may be empty if ENDO-only or CMIP6 failed)
     if all_fc_scen:
         forecasts_scenarios_all = pd.concat(all_fc_scen, ignore_index=True)
     else:
@@ -915,9 +1012,17 @@ def main() -> None:
             ]
         )
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    # -----------------------------
+    # GUARDRAILS: never write empty/invalid outputs
+    # -----------------------------
+    if metrics_df.empty or metrics_df.shape[1] == 0:
+        raise RuntimeError("Core produced EMPTY metrics_df (no rows/columns).")
+    if skill_df.empty or skill_df.shape[1] == 0:
+        raise RuntimeError("Core produced EMPTY skill_df (no rows/columns).")
+    if fc_df.empty or fc_df.shape[1] == 0:
+        raise RuntimeError("Core produced EMPTY forecasts_df (no rows/columns).")
 
+    # Save
     metrics_path = outdir / "metrics_v0_6.csv"
     skill_path = outdir / "skill_v0_6.csv"
     fc_path = outdir / "forecasts_v0_6.csv"
@@ -933,5 +1038,13 @@ def main() -> None:
     print(f"Skill rows:              {len(skill_df)} | Saved: {skill_path}")
     print(f"Forecast rows:           {len(fc_df)} | Saved: {fc_path}")
     print(f"Forecast scenarios rows: {len(forecasts_scenarios_all)} | Saved: {fc_scen_path}")
-    if len(metrics_df) > 0:
-        print(metrics_df.head(1).to_csv(index=False).strip())
+    print(metrics_df.head(1).to_csv(index=False).strip())
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(">>> FATAL ERROR in run_core_v0_6.py:", repr(e))
+        traceback.print_exc()
+        raise
