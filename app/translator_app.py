@@ -17,6 +17,9 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
+import zipfile
+import shutil
+from urllib.request import Request, urlopen
 
 
 import hashlib
@@ -59,7 +62,18 @@ from basincast.meteo.geocode import geocode_place, reverse_geocode
 # -----------------------------
 # App config
 # -----------------------------
-APP_VERSION = "v0.16"
+APP_VERSION = "v1.0"
+
+# -----------------------------
+# DeltaPack (CMIP6 precomputed deltas) — GitHub Release asset
+# -----------------------------
+DELTAPACK_URL = "https://github.com/al16gm/BasinCast/releases/download/deltapack-cmip6-v1/deltapack_cmip6_v1.zip"
+DELTAPACK_SHA256 = "be47a159d36f2f36f77f4d9d1fb9250c22fd87b5ea979bf119804fc117882ca2"
+
+# Standard cache location expected by the core
+DELTAPACK_CACHE_DIR = Path("outputs") / "cache" / "deltapack_cmip6_v1"
+DELTAPACK_ZIP_NAME = "deltapack_cmip6_v1.zip"
+
 st.set_page_config(page_title=f"BasinCast Translator ({APP_VERSION})", layout="wide")
 
 LANG = language_selector(default="en")
@@ -1861,6 +1875,90 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
             h.update(b)
     return h.hexdigest()
 
+def _download_file(url: str, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    req = Request(url, headers={"User-Agent": "BasinCast/1.0"})
+    with urlopen(req) as r, open(dst, "wb") as f:
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def ensure_deltapack_available(status_box=None) -> Path:
+    """
+    Ensure DeltaPack exists at outputs/cache/deltapack_cmip6_v1/.
+    If missing, download ZIP from GitHub Releases, verify SHA256, and extract.
+    """
+    # Already installed?
+    if (DELTAPACK_CACHE_DIR / "metadata.json").exists():
+        return DELTAPACK_CACHE_DIR
+
+    # Download into outputs/cache/
+    cache_root = DELTAPACK_CACHE_DIR.parent
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    zip_path = cache_root / DELTAPACK_ZIP_NAME
+    tmp_extract = cache_root / "_tmp_extract_deltapack"
+
+    if status_box is not None:
+        status_box.caption("Downloading DeltaPack (CMIP6) from GitHub Releases...")
+
+    # Fresh download (avoid partial/old zip)
+    if zip_path.exists():
+        try:
+            zip_path.unlink()
+        except Exception:
+            pass
+
+    _download_file(DELTAPACK_URL, zip_path)
+
+    # Verify checksum
+    if status_box is not None:
+        status_box.caption("Verifying DeltaPack SHA256...")
+
+    got = _sha256_file(zip_path)
+    if got.lower() != DELTAPACK_SHA256.lower():
+        raise RuntimeError(
+            f"DeltaPack SHA256 mismatch.\nExpected: {DELTAPACK_SHA256}\nGot: {got}\n"
+            "Delete the zip and try again."
+        )
+
+    # Extract safely to temp folder
+    if tmp_extract.exists():
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+    tmp_extract.mkdir(parents=True, exist_ok=True)
+
+    if status_box is not None:
+        status_box.caption("Extracting DeltaPack...")
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(tmp_extract)
+
+    # The zip may contain either:
+    #  - files directly, or
+    #  - a single folder containing metadata.json
+    extracted_root = tmp_extract
+    candidates = [p for p in tmp_extract.iterdir() if p.is_dir()]
+    if len(candidates) == 1 and (candidates[0] / "metadata.json").exists():
+        extracted_root = candidates[0]
+
+    if not (extracted_root / "metadata.json").exists():
+        raise RuntimeError("DeltaPack extracted but metadata.json not found.")
+
+    # Move into final location
+    if DELTAPACK_CACHE_DIR.exists():
+        shutil.rmtree(DELTAPACK_CACHE_DIR, ignore_errors=True)
+
+    shutil.move(str(extracted_root), str(DELTAPACK_CACHE_DIR))
+    shutil.rmtree(tmp_extract, ignore_errors=True)
+
+    if status_box is not None:
+        status_box.caption("DeltaPack ready ✅")
+
+    return DELTAPACK_CACHE_DIR
+
 def _try_git_commit_hash() -> str:
     try:
         import subprocess
@@ -1977,6 +2075,16 @@ def _run_core_cli(
 
     # ✅ FORCE ABSOLUTE PATHS (prevents "core wrote outputs elsewhere")
     outdir_abs = outdir.resolve()
+
+    # Ensure DeltaPack is available for CMIP6 scenarios (non-blocking for operational forecast)
+    try:
+        ensure_deltapack_available(status_box=status_box)
+    except Exception as e:
+        # Do not stop the run; just warn (scenarios will be skipped)
+        if status_box is not None:
+            status_box.error(f"DeltaPack download/verify failed: {e!r}")
+        else:
+            st.warning(f"DeltaPack download/verify failed: {e!r}")
 
     tmp_inp = outdir_abs / "_tmp_canonical_for_core.csv"
     df_input.to_csv(tmp_inp, index=False)
