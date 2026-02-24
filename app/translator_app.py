@@ -29,6 +29,15 @@ from pyproj import CRS, Transformer
 
 import plotly.graph_objects as go
 
+import sys
+from pathlib import Path
+
+# Ensure src/ is importable on Streamlit Cloud
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../app -> repo root
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 # -----------------------------
 # BasinCast imports (existing project modules)
 # -----------------------------
