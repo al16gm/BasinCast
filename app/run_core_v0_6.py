@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 import sys
+import os
+
 
 # Ensure "src/" is importable when running from Streamlit/subprocess
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -197,6 +199,12 @@ def apply_meteo_deltas(
 # Models
 # -----------------------------
 def model_zoo() -> Dict[str, object]:
+    fast = bool(int(os.environ.get("BASINCAST_FAST", "0")))
+    if fast:
+        return {
+            "bayes_ridge": BayesianRidge(),
+            "gbr": GradientBoostingRegressor(random_state=42),
+        }
     return {
         "bayes_ridge": BayesianRidge(),
         "gbr": GradientBoostingRegressor(random_state=42),
@@ -475,6 +483,7 @@ class RunConfig:
     inner_val_months: int = 36
     planning_kge: float = 0.6
     advisory_kge: float = 0.3
+    origin_stride: int = 1
 
     def __post_init__(self):
         if self.horizons is None:
@@ -571,6 +580,9 @@ def run_point(
 
     # Evaluate horizons on holdout origins (months inside holdout window)
     holdout_origins = dfp.loc[(dfp["date"] >= cutoff) & (dfp["date"] <= last_date), "date"].tolist()
+    # FAST: evaluate every 3 months instead of every month (cuts cost ~3x)
+    origin_stride = int(getattr(cfg, "origin_stride", 1))
+    holdout_origins = holdout_origins[::max(origin_stride, 1)]
 
     kge_by_family = {fam: {} for fam in families}
     rmse_by_family = {fam: {} for fam in families}
@@ -876,6 +888,11 @@ def run_point(
                                 tmax_col="tmax_c",
                                 tmin_col="tmin_c",
                             )
+
+                            if "demand" in exog_scen.columns:
+                                DEM_DELTA = {"Favorable": -0.05, "Base": 0.0, "Unfavorable": 0.10}  # ejemplo paper2
+                                exog_scen["demand"] = pd.to_numeric(exog_scen["demand"], errors="coerce")
+                                exog_scen["demand"] = exog_scen["demand"] * (1.0 + float(DEM_DELTA.get(scen_name, 0.0)))
 
                             path_scen = recursive_forecast_path_delta(
                                 model=scenario_model,

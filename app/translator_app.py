@@ -2423,7 +2423,20 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         )
 
     fig = go.Figure()
-
+    # -----------------------------
+    # Fixed color palette (avoid collisions with scenario colors)
+    # -----------------------------
+    COL = {
+        "observed": "deepskyblue",
+        "forecast_plan": "royalblue",
+        "forecast_adv": "dodgerblue",
+        "forecast_beyond": "lightslategray",
+        "p10p90_fill": "rgba(120,120,255,0.18)",
+        "scenario_band_fill": "rgba(200,200,200,0.20)",
+        "scenario_fav": "green",
+        "scenario_base": "orange",
+        "scenario_unfav": "red",
+    }
     g_obs_plot = g_obs.copy()
     g_obs_plot["date"] = pd.to_datetime(g_obs_plot["date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
     g_obs_plot = g_obs_plot.dropna(subset=["date"]).sort_values("date")
@@ -2454,7 +2467,11 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         g_obs_plot = g_obs_plot[(g_obs_plot["date"] >= d0_ts) & (g_obs_plot["date"] <= d1_ts)].copy()
         mf = mf[(mf["date"] >= d0_ts) & (mf["date"] <= d1_ts)].copy()
 
-    fig.add_trace(go.Scatter(x=g_obs_plot["date"], y=g_obs_plot["value"], mode="lines", name="Observed"))
+    fig.add_trace(go.Scatter(
+        x=g_obs_plot["date"], y=g_obs_plot["value"],
+        mode="lines", name="Observed",
+        line=dict(color=COL["observed"])
+    ))
 
     # -----------------------------
     # ✅ FIX: ALWAYS show Planning vs Advisory vs Beyond segments
@@ -2490,26 +2507,95 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
         else:
             mf_beyond = mf_rest.copy()
 
+    # -----------------------------
+    # P10–P90 uncertainty band from output RMSE (fast, paper-grade baseline)
+    # -----------------------------
+    show_p10p90 = st.checkbox("Show P10–P90 (from RMSE)", value=True, key=f"p10p90_{pid}")
+
+    if show_p10p90 and (not g_sk.empty) and {"family", "model_type", "horizon", "rmse"}.issubset(set(g_sk.columns)):
+        sk0 = g_sk.copy()
+        sk0["horizon"] = pd.to_numeric(sk0["horizon"], errors="coerce")
+        sk0["rmse"] = pd.to_numeric(sk0["rmse"], errors="coerce")
+        sk0 = sk0.dropna(subset=["horizon", "rmse"]).copy()
+
+        # filter to the selected model/family when possible
+        fam0 = str(selected_family)
+        mt0 = str(selected_model_type)
+        sk_sel = sk0[(sk0["family"].astype(str) == fam0) & (sk0["model_type"].astype(str) == mt0)].copy()
+        if sk_sel.empty:
+            sk_sel = sk0[sk0["family"].astype(str) == fam0].copy()
+
+        # Build rmse_by_horizon dict (fallback to global median if missing)
+        rmse_by_h = dict(zip(sk_sel["horizon"].astype(int), sk_sel["rmse"].astype(float)))
+        rmse_default = float(np.nanmedian(sk0["rmse"].to_numpy())) if len(sk0) else 0.0
+
+        z = 1.2816  # Normal P10/P90
+        band_df = mf_seg[["date", "horizon", "y_forecast"]].copy()
+        band_df["sigma"] = band_df["horizon"].map(lambda h: rmse_by_h.get(int(h), rmse_default))
+        band_df["p10"] = band_df["y_forecast"] - z * band_df["sigma"]
+        band_df["p90"] = band_df["y_forecast"] + z * band_df["sigma"]
+        band_df["p10"] = band_df["p10"].clip(lower=0.0)
+
+        # Respect zoom window (if active)
+        if "use_zoom" in locals() and use_zoom:
+            band_df = band_df[(band_df["date"] >= d0_ts) & (band_df["date"] <= d1_ts)].copy()
+
+        if len(band_df) > 1:
+            # Draw P10–P90 band underneath main forecast
+            fig.add_trace(go.Scatter(
+                x=band_df["date"],
+                y=band_df["p90"],
+                mode="lines",
+                line=dict(width=0),
+                name="P90",
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+            fig.add_trace(go.Scatter(
+                x=band_df["date"],
+                y=band_df["p10"],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(120,120,255,0.18)",
+                name="P10–P90 (RMSE)",
+                hoverinfo="skip",
+            ))
+
+    fam_label = str(selected_family)
+    if fam_label.startswith("EXOG"):
+        fam_label = "EXOG"
+    elif fam_label.startswith("ENDO"):
+        fam_label = "ENDO"
+    elif fam_label.startswith("BASELINE"):
+        fam_label = "BASELINE"
+    elif fam_label.startswith("DEMAND"):
+        fam_label = "DEMAND"
+    else:
+        fam_label = str(selected_family)
+
     # Plot segments
     if not mf_plan.empty:
         fig.add_trace(go.Scatter(
             x=mf_plan["date"], y=mf_plan["y_forecast"],
             mode="lines",
-            name=(f"Forecast (planning ≤ {plan_h}m)" if plan_h > 0 else "Forecast (reliable)")
+            name=(f"{fam_label} forecast (operational, no-delta; planning ≤ {plan_h}m)" if plan_h > 0
+                else f"{fam_label} forecast (operational, no-delta; reliable)"),
+            line=dict(color=COL["forecast_plan"])
         ))
     if not mf_adv.empty:
         fig.add_trace(go.Scatter(
             x=mf_adv["date"], y=mf_adv["y_forecast"],
             mode="lines",
-            name=f"Forecast (advisory ≤ {adv_h}m)",
-            line=dict(dash="dash")
+            nname=f"{fam_label} forecast (operational, no-delta; advisory ≤ {adv_h}m)",
+            line=dict(color=COL["forecast_adv"], dash="dash")
         ))
     if not mf_beyond.empty:
         fig.add_trace(go.Scatter(
             x=mf_beyond["date"], y=mf_beyond["y_forecast"],
             mode="lines",
-            name="Forecast (beyond advisory)",
-            line=dict(dash="dot")
+            name=f"{fam_label} forecast (operational, no-delta; beyond advisory)",
+            line=dict(color=COL["forecast_beyond"], dash="dot")
         ))
 
     # Shading (paper-friendly)
@@ -2573,6 +2659,12 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
             preferred = ["Favorable", "Base", "Unfavorable"]
             scen_list = preferred + [s for s in sorted(sc["scenario"].astype(str).unique()) if s not in preferred]
 
+            SCEN_COLOR = {
+                "Favorable": "green",
+                "Base": "orange",
+                "Unfavorable": "red",
+            }
+
             for sname in scen_list:
                 gg = sc[sc["scenario"].astype(str) == sname].sort_values("date").copy()
                 if gg.empty:
@@ -2582,11 +2674,21 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                 if "use_zoom" in locals() and use_zoom:
                     gg = gg[(gg["date"] >= d0) & (gg["date"] <= d1)].copy()
 
+                SCEN_LABEL = {
+                    "Favorable": "CMIP6 SSP126 (low emissions)",
+                    "Base": "CMIP6 SSP245 (middle emissions)",
+                    "Unfavorable": "CMIP6 SSP585 (high emissions)",
+                }
+
+                label = SCEN_LABEL.get(sname, f"CMIP6 {sname}")
+                color = SCEN_COLOR.get(sname, None)
+
                 fig.add_trace(go.Scatter(
                     x=gg["date"],
                     y=gg["y_forecast"],
                     mode="lines",
-                    name=f"Scenario {sname}",
+                    name=label,
+                    line=dict(color=color) if color else None,
                 ))
 
         # If you want ONLY the selected family, uncomment:
@@ -2618,6 +2720,7 @@ if "core_metrics" in st.session_state and "core_skill" in st.session_state and "
                     mode="lines",
                     line=dict(width=0),
                     fill="tonexty",
+                    fillcolor=COL["scenario_band_fill"],
                     name="Scenario uncertainty band",
                     hoverinfo="skip",
                 ))
