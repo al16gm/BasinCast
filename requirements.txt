@@ -6,3 +6,4 @@ scikit-learn>=1.4
 openpyxl>=3.1
 requests>=2.31
 pyproj>=3.6
+rapidfuzz>=3.6
